@@ -138,7 +138,17 @@ jobs:
             exit 1
           fi
           python3 "$GITHUB_WORKSPACE/scripts/check-nx721j-pmgr.py" "${kernels[0]}"
-          llvm-nm "${kernels[0]}" | awk '$3 == "_sheng_pmgr_run" && $2 ~ /^[Tt]$/ { found=1 } END { exit !found }'
+          llvm-nm -m --defined-only "${kernels[0]}" | awk '
+            $NF == "_sheng_pmgr_run" && ($2 == "(__TEXT_EXEC,__text)" || $2 == "(__TEXT,__text)") {
+              print
+              found=1
+            }
+            END {
+              if (!found) {
+                print "PMGR startup hook missing from kernel text" > "/dev/stderr"
+                exit 1
+              }
+            }'
 
       - name: Upload kernel output and logs
         uses: actions/upload-artifact@v4
@@ -149,6 +159,15 @@ jobs:
             unixnu/out/*/logs/**
             unixnu/out/*/tree/build/sheng-platform-power/build-report.json
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload logs from failed builds
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nx721j-kernel-logs-${{ github.run_number }}
+          path: unixnu/out/*/logs/**
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Remove proprietary inputs
