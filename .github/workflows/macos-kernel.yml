@@ -116,9 +116,13 @@ jobs:
           device = Path(sys.argv[1])
           config = device / "configs/nx721j_probe_defconfig"
           text = config.read_text()
-          options = ("CONFIG_XNU_SHENG_PMGR", "CONFIG_XNU_TRUST_CACHE_RUNTIME")
+          options = (
+              "CONFIG_XNU_SHENG_PMGR",
+              "CONFIG_XNU_TRUST_CACHE_RUNTIME",
+              "CONFIG_XNU_NATIVE_CS_HASH_CACHE",
+          )
           if any(f"{option}=" in text for option in options):
-              raise SystemExit("Duplicate PMGR or trust-cache configuration")
+              raise SystemExit("Duplicate experimental kernel configuration")
           config.write_text(text.rstrip() + "\n" + "".join(f"{option}=y\n" for option in options))
 
           board = device / "board.toml"
@@ -142,11 +146,23 @@ jobs:
           llvm-nm -m --defined-only "${kernels[0]}" | awk '
             $NF == "_sheng_pmgr_run" && ($2 == "(__TEXT_EXEC,__text)" || $2 == "(__TEXT,__text)") {
               print
-              found=1
+              pmgr=1
+            }
+            $NF == "_cs_native4k_hash_cache_version" {
+              print
+              cache_version=1
+            }
+            $NF == "_cs_native4k_full_blocks" {
+              print
+              cache_counter=1
             }
             END {
-              if (!found) {
+              if (!pmgr) {
                 print "PMGR startup hook missing from kernel text" > "/dev/stderr"
+                exit 1
+              }
+              if (!cache_version || !cache_counter) {
+                print "Native 4 KiB signature hash cache missing from kernel" > "/dev/stderr"
                 exit 1
               }
             }'
