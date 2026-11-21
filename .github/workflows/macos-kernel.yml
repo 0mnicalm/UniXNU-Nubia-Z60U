@@ -23,6 +23,10 @@ on:
         description: Build the experimental NX721J PMGR bridge after the baseline kernel
         type: boolean
         default: false
+      ufs_passive:
+        description: Include the NX721J UFS register survey in the experimental kernel
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -103,17 +107,22 @@ jobs:
           ./unixnu build kernel "${args[@]}" -D "$GITHUB_WORKSPACE"
 
       - name: Build the experimental PMGR kernel
-        if: ${{ inputs.pmgr }}
+        if: ${{ inputs.pmgr || inputs.ufs_passive }}
         working-directory: unixnu
         env:
           IPSW_URL: ${{ inputs.ipsw_url }}
           GITHUB_TOKEN: ${{ github.token }}
+          UFS_PASSIVE: ${{ inputs.ufs_passive }}
         run: |
-          python3 - "$GITHUB_WORKSPACE" <<'PY'
+          if [ "$UFS_PASSIVE" = true ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/prepare-nx721j-native-ufs.py" --unixnu "$PWD"
+          fi
+          python3 - "$GITHUB_WORKSPACE" "$UFS_PASSIVE" <<'PY'
           from pathlib import Path
           import sys
 
           device = Path(sys.argv[1])
+          ufs_passive = sys.argv[2] == "true"
           config = device / "configs/nx721j_probe_defconfig"
           text = config.read_text()
           options = (
@@ -123,6 +132,11 @@ jobs:
           )
           if any(f"{option}=" in text for option in options):
               raise SystemExit("Duplicate experimental kernel configuration")
+          if ufs_passive:
+              option = "CONFIG_XNU_NATIVE_UFS=n\n"
+              if text.count(option) != 1:
+                  raise SystemExit("Expected one disabled NativeUfs option")
+              text = text.replace(option, "CONFIG_XNU_NATIVE_UFS=y\n")
           config.write_text(text.rstrip() + "\n" + "".join(f"{option}=y\n" for option in options))
 
           board = device / "board.toml"
@@ -130,7 +144,10 @@ jobs:
           anchor = '  "build-libpthread-kernel.py",\n'
           if text.count(anchor) != 1 or "build-nx721j-pmgr.py" in text:
               raise SystemExit("Unexpected kernel archive list")
-          board.write_text(text.replace(anchor, anchor + '  "build-nx721j-pmgr.py",\n'))
+          archives = '  "build-nx721j-pmgr.py",\n'
+          if ufs_passive:
+              archives += '  "build-arm-driver.py NativeUfs",\n'
+          board.write_text(text.replace(anchor, anchor + archives))
           PY
           ./unixnu defconfig nx721j_probe_defconfig -D "$GITHUB_WORKSPACE"
           args=()
@@ -143,6 +160,25 @@ jobs:
             exit 1
           fi
           python3 "$GITHUB_WORKSPACE/scripts/check-nx721j-pmgr.py" "${kernels[0]}"
+          if [ "$UFS_PASSIVE" = true ]; then
+            python3 - "${kernels[0]}" <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          kernel = Path(sys.argv[1])
+          symbols = subprocess.check_output(
+              ["llvm-nm", "--defined-only", str(kernel)], text=True
+          )
+          names = {line.split()[-1] for line in symbols.splitlines() if line.split()}
+          if "__ZN9NativeUfs5startEP9IOService" not in names:
+              raise SystemExit("NX721J passive NativeUfs service missing from kernel")
+          if any("NativeUfs9startRoot" in name for name in names):
+              raise SystemExit("Unexpected active NativeUfs root transport in kernel")
+          if b"NATIVE_UFS NX721J passive survey" not in kernel.read_bytes():
+              raise SystemExit("NX721J register survey absent from kernel")
+          PY
+          fi
           llvm-nm -m --defined-only "${kernels[0]}" | awk '
             $NF == "_sheng_pmgr_run" && ($2 == "(__TEXT_EXEC,__text)" || $2 == "(__TEXT,__text)") {
               print

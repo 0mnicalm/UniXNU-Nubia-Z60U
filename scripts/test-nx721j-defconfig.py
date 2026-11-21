@@ -98,11 +98,14 @@ class Nx721jDefconfigTests(unittest.TestCase):
             (uefi_font / "Font.h").touch()
             self.assertEqual(PATCHER_MODULE.resolve_font_dir(root, root / "uefi"), uefi_font)
 
-    def test_workflow_uses_pinned_official_xnu_without_native_ufs_mutation(self) -> None:
+    def test_workflow_uses_pinned_official_xnu_and_opts_in_to_native_ufs(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertGreaterEqual(workflow.count(PINNED_UNIXNU), 2)
         self.assertNotIn("unixnu_ref || 'main'", workflow)
-        self.assertNotIn("prepare-nx721j-native-ufs.py", workflow)
+        baseline, experiment = workflow.split("- name: Build the experimental PMGR kernel", 1)
+        self.assertIn("ufs_passive:\n", baseline)
+        self.assertNotIn("prepare-nx721j-native-ufs.py", baseline)
+        self.assertRegex(experiment, r'if \[ "\$UFS_PASSIVE" = true \]; then\n\s+python3 "[^"]+/prepare-nx721j-native-ufs\.py"')
         self.assertNotIn("IOStorageFamily", workflow)
 
     def test_payload_workflow_continues_without_reset_and_passes_no_ufs_args(self) -> None:
