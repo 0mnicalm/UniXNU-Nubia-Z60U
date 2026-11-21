@@ -116,9 +116,10 @@ jobs:
           device = Path(sys.argv[1])
           config = device / "configs/nx721j_probe_defconfig"
           text = config.read_text()
-          if "CONFIG_XNU_SHENG_PMGR=" in text:
-              raise SystemExit("Duplicate PMGR configuration")
-          config.write_text(text.rstrip() + "\nCONFIG_XNU_SHENG_PMGR=y\n")
+          options = ("CONFIG_XNU_SHENG_PMGR", "CONFIG_XNU_TRUST_CACHE_RUNTIME")
+          if any(f"{option}=" in text for option in options):
+              raise SystemExit("Duplicate PMGR or trust-cache configuration")
+          config.write_text(text.rstrip() + "\n" + "".join(f"{option}=y\n" for option in options))
 
           board = device / "board.toml"
           text = board.read_text()
@@ -146,6 +147,17 @@ jobs:
             END {
               if (!found) {
                 print "PMGR startup hook missing from kernel text" > "/dev/stderr"
+                exit 1
+              }
+            }'
+          llvm-objdump -d --disassemble-symbols=_kernel_bootstrap_thread "${kernels[0]}" | awk '
+            $NF == "<_trust_cache_runtime_init>" && /[[:space:]]bl[[:space:]]/ {
+              print
+              found=1
+            }
+            END {
+              if (!found) {
+                print "Trust-cache runtime initialization missing from kernel bootstrap" > "/dev/stderr"
                 exit 1
               }
             }'
