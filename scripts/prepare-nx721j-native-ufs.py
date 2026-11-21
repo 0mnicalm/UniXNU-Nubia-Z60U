@@ -17,8 +17,8 @@ from pathlib import Path
 OFFICIAL_NATIVE_UFS_SHA256 = "24f549be5006ab5c463c67aa01ee38511b185853f878e12b4bb70830313ae9ed"
 # The canonical CI output is LF.  The second digest is the same source after
 # Windows checkout line-ending conversion in the local reference worktree.
-PATCHED_NATIVE_UFS_SHA256 = "66197f3a34934d9bc7469d2298e816bd042b17936235c81221ffa9edadff6ec4"
-PATCHED_NATIVE_UFS_WINDOWS_SHA256 = "bd3a299aa22bb9b6d89f5839bf88060bb70e49dfd5ebd9c393a143e35d9db17b"
+PATCHED_NATIVE_UFS_SHA256 = "f5a086f41f3ef68dbb01d021d0e30639b8fc1a69adfb2c49ba79815624bf02e6"
+PATCHED_NATIVE_UFS_WINDOWS_SHA256 = "4f0f8f242e890177e97fd84eff28504a845b94c58424627e837e47cf0b0831bf"
 
 NX721J_HEADER = """// SPDX-License-Identifier: BSD-2-Clause-Patent
 // NX721J (Nubia Z60 Ultra, Qualcomm Pineapple) UFS facts.
@@ -82,23 +82,64 @@ NX721J_INSPECT = """  if (nx721jRequested ()) {
       panic ("NATIVE_UFS NX721J inspect: map failed host=%p smmu=%p",
              (void *) hc, (void *) smmu);
     }
-    panic ("NATIVE_UFS NX721J passive survey\\n"
-           "host=%llx/%llx phy=%llx/%llx gcc=%llx/%llx\\n"
-           "stream=%x reset=%x dma=%llx/%llx clocks=%u\\n"
-           "cap=%08x ver=%08x is=%08x hcs=%08x hce=%08x\\n"
-           "list=%08x:%08x db=%08x rsr=%08x\\n"
-           "smmu id0=%08x id1=%08x id2=%08x\\n"
-           "read-only facts; no GCC/PHY/reset/SMMU writes",
-           NX721J_UFS_HOST_BASE, NX721J_UFS_HOST_SIZE,
-           NX721J_UFS_PHY_BASE, NX721J_UFS_PHY_SIZE,
-           NX721J_PINEAPPLE_GCC_BASE, NX721J_PINEAPPLE_GCC_SIZE,
-           NX721J_UFS_STREAM_ID, NX721J_UFS_RESET_ID,
-           NX721J_UFS_DMA_POOL_BASE, NX721J_UFS_DMA_POOL_SIZE,
-           NX721J_UFS_CLOCK_COUNT,
-           read32 (hc, 0x00), read32 (hc, 0x08), read32 (hc, 0x20),
-           read32 (hc, 0x30), read32 (hc, 0x34),
-           read32 (hc, 0x54), read32 (hc, 0x50), read32 (hc, 0x58), read32 (hc, 0x60),
-           read32 (smmu, 0x20), read32 (smmu, 0x24), read32 (smmu, 0x28));
+    // UFSHCI CAP bit 30 advertises MCQ. MEM_CFG bit 0 selects it.
+    uint32_t cap = read32 (hc, 0x00);
+    bool mcqCapable = cap & (1U << 30);
+    uint32_t memCfg = mcqCapable ? read32 (hc, 0x300) : 0;
+    uint32_t mcqCap = mcqCapable ? read32 (hc, 0x04) : 0;
+    uint32_t mcqCfg = mcqCapable ? read32 (hc, 0x380) : 0;
+
+    // ARM SMMUv2 GR0. In extended-ID mode the valid bit is in S2CR,
+    // while the high bit of SMR contributes to the 16-bit mask.
+    uint32_t scr0 = read32 (smmu, 0x00);
+    uint32_t id0 = read32 (smmu, 0x20);
+    uint32_t id1 = read32 (smmu, 0x24);
+    bool extended = (id0 & (1U << 8)) && (scr0 & (1U << 3));
+    unsigned idMask = extended ? 0xffffU : 0x7fffU;
+    unsigned count = (id0 & (1U << 27)) ? (id0 & 0xffU) : 0;
+    if (count > 128) {
+      panic ("NATIVE_UFS NX721J passive survey: unexpected SMR count %u", count);
+    }
+    unsigned matches = 0, first = 0xffffU;
+    uint32_t matchSmr = 0, matchS2cr = 0;
+    for (unsigned index = 0; index < count; index++) {
+      uint32_t smr = read32 (smmu, 0x800 + 4 * index);
+      uint32_t s2cr = read32 (smmu, 0xc00 + 4 * index);
+      bool valid = extended ? (s2cr & (1U << 10)) : (smr & (1U << 31));
+      unsigned mask = (smr >> 16) & idMask;
+      if (!valid || ((smr ^ NX721J_UFS_STREAM_ID) & idMask & ~mask)) {
+        continue;
+      }
+      if (matches++ == 0) {
+        first = index;
+        matchSmr = smr;
+        matchS2cr = s2cr;
+      }
+    }
+
+    // Only observe the bank's enable bit on a unique translation route.
+    // Do not follow its page tables or dereference firmware DMA addresses.
+    unsigned bank = matchS2cr & 0xffU;
+    unsigned type = (matchS2cr >> 16) & 3U;
+    unsigned pageSize = (id1 & (1U << 31)) ? 0x10000U : 0x1000U;
+    unsigned globalPages = 1U << (((id1 >> 28) & 7U) + 1U);
+    uint32_t sctlr = 0;
+    unsigned bankRead = 0;
+    uint32_t bankOffset = (globalPages + bank) * pageSize;
+    if (matches == 1 && type == 0 && bank < (id1 & 0xffU) &&
+        bankOffset <= NX721J_APPS_SMMU_SIZE - sizeof (uint32_t)) {
+      sctlr = read32 (smmu, bankOffset);
+      bankRead = 1;
+    }
+    panic ("NATIVE_UFS NX721J passive survey: queue and DMA\\n"
+           "cap=%08x hcs=%08x hce=%08x\\n"
+           "memcfg=%08x mcqcap=%08x mcqcfg=%08x\\n"
+           "scr0=%08x id0=%08x id1=%08x\\n"
+           "sid60 matches=%u first=%x smr=%08x s2cr=%08x\\n"
+           "bank=%x type=%u read=%u sctlr=%08x",
+           cap, read32 (hc, 0x30), read32 (hc, 0x34),
+           memCfg, mcqCap, mcqCfg, scr0, id0, id1, matches, first, matchSmr,
+           matchS2cr, bank, type, bankRead, sctlr);
   }
 """
 

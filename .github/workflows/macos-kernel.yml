@@ -175,7 +175,7 @@ jobs:
               raise SystemExit("NX721J passive NativeUfs service missing from kernel")
           if any("NativeUfs9startRoot" in name for name in names):
               raise SystemExit("Unexpected active NativeUfs root transport in kernel")
-          if b"NATIVE_UFS NX721J passive survey" not in kernel.read_bytes():
+          if b"NATIVE_UFS NX721J passive survey: queue and DMA" not in kernel.read_bytes():
               raise SystemExit("NX721J register survey absent from kernel")
           PY
           fi
