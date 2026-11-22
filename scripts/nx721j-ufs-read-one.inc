@@ -91,6 +91,78 @@ static bool nx721jGptSuperName (const uint8_t *entry)
   return memcmp (entry + 56, name, sizeof (name)) == 0;
 }
 
+static uint32_t nx721jBlockCrc (const uint8_t *data, uint32_t bytes)
+{
+  uint32_t crc = ~0U;
+  for (uint32_t at = 0; at < bytes; ++at) {
+    crc = nx721jCrcByte (crc, data[at]);
+  }
+  return ~crc;
+}
+
+struct Nx721jLpTable {
+  uint32_t offset;
+  uint32_t count;
+  uint32_t width;
+
+  bool fits (uint32_t bytes, uint32_t entryBytes) const {
+    return width == entryBytes && offset <= bytes && uint64_t (count) * width <= bytes - offset;
+  }
+};
+
+static Nx721jLpTable nx721jLpTable (const uint8_t *descriptor)
+{
+  return {nx721jReadLe32 (descriptor), nx721jReadLe32 (descriptor + 4), nx721jReadLe32 (descriptor + 8)};
+}
+
+// Resolve the first 4 KiB of a named linear extent using liblp's 512-byte sectors.
+static uint32_t nx721jLogicalFirstLba (const uint8_t *metadata, uint32_t superFirst, uint32_t superLast, const char *name)
+{
+  constexpr uint32_t sectorsPerBlock = nx721jLun0BlockBytes / 512;
+  uint32_t headerBytes = nx721jReadLe32 (metadata + 8);
+  uint32_t tableBytes = nx721jReadLe32 (metadata + 44);
+  const uint8_t *tables = metadata + headerBytes;
+  auto partitions = nx721jLpTable (metadata + 80);
+  auto extents = nx721jLpTable (metadata + 92);
+  auto groups = nx721jLpTable (metadata + 104);
+  auto devices = nx721jLpTable (metadata + 116);
+  if (!partitions.fits (tableBytes, 52) || !extents.fits (tableBytes, 24) ||
+      !groups.fits (tableBytes, 48) || !devices.fits (tableBytes, 64) || devices.count != 1) {
+    return 0;
+  }
+
+  const uint8_t *device = tables + devices.offset;
+  uint64_t firstUsableSector = nx721jReadLe64 (device);
+  uint64_t superBytes = uint64_t (superLast - superFirst + 1) * nx721jLun0BlockBytes;
+  if (memcmp (device + 24, "super", 6) || nx721jReadLe64 (device + 16) != superBytes) {
+    return 0;
+  }
+
+  const size_t nameBytes = strlen (name) + 1;
+  uint32_t lba = 0;
+  for (uint32_t index = 0; index < partitions.count; ++index) {
+    const uint8_t *entry = tables + partitions.offset + index * partitions.width;
+    if (memcmp (entry, name, nameBytes)) {
+      continue;
+    }
+    uint32_t first = nx721jReadLe32 (entry + 40);
+    uint32_t count = nx721jReadLe32 (entry + 44);
+    if (lba || !count || first >= extents.count || count > extents.count - first) {
+      return 0;
+    }
+    const uint8_t *extent = tables + extents.offset + first * extents.width;
+    uint64_t sectors = nx721jReadLe64 (extent);
+    uint64_t start = nx721jReadLe64 (extent + 12);
+    if (nx721jReadLe32 (extent + 8) || nx721jReadLe32 (extent + 20) ||
+        start < firstUsableSector || start >= superBytes / 512 || start % sectorsPerBlock ||
+        sectors < sectorsPerBlock || sectors > superBytes / 512 - start) {
+      return 0;
+    }
+    lba = superFirst + uint32_t (start / sectorsPerBlock);
+  }
+  return lba;
+}
+
 struct Nx721jScsiSense {
   unsigned segmentBytes = 0;
   unsigned senseBytes = 0;
@@ -362,34 +434,62 @@ struct Nx721jUfsCompletion {
   }
 
   // Android liblp places two geometry blocks after a reserved 4 KiB block,
-  // followed by the primary metadata slots at a stride of metadata_max_size.
+  // followed by the primary and backup metadata slots.
   constexpr uint32_t metadataMaxBytes = 65536;
-  struct SuperBlock {
-    const char *stage;
-    uint32_t offset;
-    uint32_t magic;
-    uint32_t crc;
-  };
-  constexpr SuperBlock checks[] = {
-    {"super geometry", 1, 0x616c4467, 0x59c8de0f},
-    {"super backup geometry", 2, 0x616c4467, 0x59c8de0f},
-    {"super metadata A", 3, 0x414c5030, 0xd6cea9a8},
-    {"super metadata B", 3 + metadataMaxBytes / page, 0x414c5030, 0xd6cea9a8},
-  };
-  for (const auto &block : checks) {
-    uint32_t lba = uint32_t (superFirst) + block.offset;
-    getBlock (block.stage, lba);
-    uint32_t crc = ~0U;
-    for (uint32_t at = 0; at < page; ++at) {
-      crc = nx721jCrcByte (crc, data[at]);
-    }
-    uint32_t magic = nx721jReadLe32 (data);
-    if (magic != block.magic || ~crc != block.crc) {
-      panic ("NX721J XNU %s DIFF\nLBA=%u magic=%08x\nCRC=%08x expected=%08x",
-             block.stage, lba, magic, ~crc, block.crc);
+  constexpr uint32_t metadataSlots = 3;
+  constexpr uint32_t metadataStride = metadataMaxBytes / page;
+  for (uint32_t offset = 1; offset <= 2; ++offset) {
+    uint32_t lba = uint32_t (superFirst) + offset;
+    getBlock ("super geometry", lba);
+    uint32_t crc = nx721jBlockCrc (data, page);
+    if (crc != 0x59c8de0f || nx721jReadLe32 (data + 40) != metadataMaxBytes ||
+        nx721jReadLe32 (data + 44) != metadataSlots || nx721jReadLe32 (data + 48) != page) {
+      panic ("NX721J XNU super geometry DIFF\nLBA=%u CRC=%08x", lba, crc);
     }
   }
-  panic ("NX721J XNU super metadata PASS\nWake: %s\nGPT sweep PASS normalized=%08x\n"
-         "super LBA=%u / 4 blocks MATCH\nGeometry CRC=59c8de0f\nSlot A/B CRC=d6cea9a8",
-         wakeResult, ~normalized, uint32_t (superFirst));
+
+  // On this device each serialized metadata copy, including all tables, fits in one block.
+  constexpr uint32_t headerBytes = 256;
+  constexpr uint32_t tableBytes = 1104;
+  constexpr uint32_t usedBytes = headerBytes + tableBytes;
+  constexpr uint32_t offsets[] = {3, 3 + metadataStride, 3 + metadataSlots * metadataStride,
+                                   3 + (metadataSlots + 1) * metadataStride};
+  for (uint32_t offset : offsets) {
+    uint32_t lba = uint32_t (superFirst) + offset;
+    getBlock ("super metadata", lba);
+    uint32_t crc = nx721jBlockCrc (data, usedBytes);
+    if (nx721jReadLe32 (data) != 0x414c5030 || nx721jReadLe32 (data + 4) != 0x0002000a ||
+        nx721jReadLe32 (data + 8) != headerBytes || nx721jReadLe32 (data + 44) != tableBytes ||
+        crc != 0x455c0234) {
+      panic ("NX721J XNU super LP tables DIFF\nLBA=%u CRC=%08x", lba, crc);
+    }
+    if (offset == offsets[0]) {
+      memcpy (saved, data, usedBytes);
+    } else if (memcmp (saved, data, usedBytes)) {
+      panic ("NX721J XNU super LP copies disagree\nLBA=%u", lba);
+    }
+  }
+
+  struct LogicalSample {
+    const char *name;
+    uint32_t crc;
+    uint32_t lba;
+  };
+  LogicalSample samples[] = {{"system_a", 0x5ccb041c, 0}, {"vendor_a", 0xe767162f, 0}};
+  for (auto &sample : samples) {
+    sample.lba = nx721jLogicalFirstLba (saved, uint32_t (superFirst), uint32_t (superLast), sample.name);
+    if (!sample.lba) {
+      panic ("NX721J XNU invalid %s logical extent", sample.name);
+    }
+    getBlock (sample.name, sample.lba);
+    uint32_t crc = nx721jBlockCrc (data, page);
+    if (data[1080] != 0x53 || data[1081] != 0xef || crc != sample.crc) {
+      panic ("NX721J XNU %s ext4 sample DIFF\nLBA=%u CRC=%08x expected=%08x",
+             sample.name, sample.lba, crc, sample.crc);
+    }
+  }
+  panic ("NX721J XNU logical extents PASS\nWake: %s\nGPT sweep PASS normalized=%08x\n"
+         "LP A/B main+backup MATCH CRC=455c0234\nsystem_a LBA=%u ext4 CRC=5ccb041c\n"
+         "vendor_a LBA=%u ext4 CRC=e767162f",
+         wakeResult, ~normalized, samples[0].lba, samples[1].lba);
 }
