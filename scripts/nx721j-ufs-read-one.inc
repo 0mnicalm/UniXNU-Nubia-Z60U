@@ -31,6 +31,11 @@ static uint64_t nx721jReadLe64 (const uint8_t *bytes)
   return nx721jReadLe32 (bytes) | (uint64_t (nx721jReadLe32 (bytes + 4)) << 32);
 }
 
+static uint16_t nx721jReadLe16 (const uint8_t *bytes)
+{
+  return uint16_t (bytes[0]) | (uint16_t (bytes[1]) << 8);
+}
+
 struct Nx721jGptHeader {
   uint64_t firstUsable;
   uint64_t lastUsable;
@@ -115,8 +120,14 @@ static Nx721jLpTable nx721jLpTable (const uint8_t *descriptor)
   return {nx721jReadLe32 (descriptor), nx721jReadLe32 (descriptor + 4), nx721jReadLe32 (descriptor + 8)};
 }
 
-// Resolve the first 4 KiB of a named linear extent using liblp's 512-byte sectors.
-static uint32_t nx721jLogicalFirstLba (const uint8_t *metadata, uint32_t superFirst, uint32_t superLast, const char *name)
+struct Nx721jLogicalExtent {
+  uint32_t firstLba = 0;
+  uint32_t blocks = 0;
+};
+
+// Resolve a named partition's first extent using liblp's 512-byte sectors.
+static Nx721jLogicalExtent nx721jLogicalExtent (const uint8_t *metadata, uint32_t superFirst, uint32_t superLast,
+                                                const char *name)
 {
   constexpr uint32_t sectorsPerBlock = nx721jLun0BlockBytes / 512;
   uint32_t headerBytes = nx721jReadLe32 (metadata + 8);
@@ -128,18 +139,18 @@ static uint32_t nx721jLogicalFirstLba (const uint8_t *metadata, uint32_t superFi
   auto devices = nx721jLpTable (metadata + 116);
   if (!partitions.fits (tableBytes, 52) || !extents.fits (tableBytes, 24) ||
       !groups.fits (tableBytes, 48) || !devices.fits (tableBytes, 64) || devices.count != 1) {
-    return 0;
+    return {};
   }
 
   const uint8_t *device = tables + devices.offset;
   uint64_t firstUsableSector = nx721jReadLe64 (device);
   uint64_t superBytes = uint64_t (superLast - superFirst + 1) * nx721jLun0BlockBytes;
   if (memcmp (device + 24, "super", 6) || nx721jReadLe64 (device + 16) != superBytes) {
-    return 0;
+    return {};
   }
 
   const size_t nameBytes = strlen (name) + 1;
-  uint32_t lba = 0;
+  Nx721jLogicalExtent result;
   for (uint32_t index = 0; index < partitions.count; ++index) {
     const uint8_t *entry = tables + partitions.offset + index * partitions.width;
     if (memcmp (entry, name, nameBytes)) {
@@ -147,20 +158,52 @@ static uint32_t nx721jLogicalFirstLba (const uint8_t *metadata, uint32_t superFi
     }
     uint32_t first = nx721jReadLe32 (entry + 40);
     uint32_t count = nx721jReadLe32 (entry + 44);
-    if (lba || !count || first >= extents.count || count > extents.count - first) {
-      return 0;
+    if (result.blocks || !count || first >= extents.count || count > extents.count - first) {
+      return {};
     }
     const uint8_t *extent = tables + extents.offset + first * extents.width;
     uint64_t sectors = nx721jReadLe64 (extent);
     uint64_t start = nx721jReadLe64 (extent + 12);
     if (nx721jReadLe32 (extent + 8) || nx721jReadLe32 (extent + 20) ||
         start < firstUsableSector || start >= superBytes / 512 || start % sectorsPerBlock ||
-        sectors < sectorsPerBlock || sectors > superBytes / 512 - start) {
-      return 0;
+        sectors < sectorsPerBlock || sectors % sectorsPerBlock || sectors > superBytes / 512 - start) {
+      return {};
     }
-    lba = superFirst + uint32_t (start / sectorsPerBlock);
+    result = {superFirst + uint32_t (start / sectorsPerBlock), uint32_t (sectors / sectorsPerBlock)};
   }
-  return lba;
+  return result;
+}
+
+static bool nx721jExt4RootEntries (const uint8_t *block, const char *name, uint32_t expectedInode, uint8_t expectedType)
+{
+  constexpr uint32_t page = nx721jLun0BlockBytes;
+  const size_t nameBytes = strlen (name);
+  bool dot = false;
+  bool dotDot = false;
+  bool found = false;
+  uint32_t offset = 0;
+  while (page - offset >= 8) {
+    const uint8_t *entry = block + offset;
+    uint32_t inode = nx721jReadLe32 (entry);
+    uint16_t recordBytes = nx721jReadLe16 (entry + 4);
+    uint8_t length = entry[6];
+    uint8_t type = entry[7];
+    if (recordBytes < 8 || recordBytes % 4 || recordBytes > page - offset || length > recordBytes - 8) {
+      return false;
+    }
+    if (inode == 2 && type == 2) {
+      dot |= length == 1 && entry[8] == '.';
+      dotDot |= length == 2 && memcmp (entry + 8, "..", 2) == 0;
+    }
+    if (length == nameBytes && memcmp (entry + 8, name, nameBytes) == 0) {
+      if (found || inode != expectedInode || type != expectedType) {
+        return false;
+      }
+      found = true;
+    }
+    offset += recordBytes;
+  }
+  return offset == page && dot && dotDot && found;
 }
 
 struct Nx721jScsiSense {
@@ -472,24 +515,64 @@ struct Nx721jUfsCompletion {
 
   struct LogicalSample {
     const char *name;
-    uint32_t crc;
-    uint32_t lba;
+    uint32_t superblockCrc;
+    const char *entry;
+    uint32_t entryInode;
+    uint8_t entryType;
+    uint32_t directoryCrc;
+    uint32_t directoryLba;
   };
-  LogicalSample samples[] = {{"system_a", 0x5ccb041c, 0}, {"vendor_a", 0xe767162f, 0}};
+  LogicalSample samples[] = {
+    {"system_a", 0x5ccb041c, "system", 51, 2, 0xb2dc8847, 0},
+    {"vendor_a", 0xe767162f, "build.prop", 3836, 1, 0xd5515dc2, 0},
+  };
   for (auto &sample : samples) {
-    sample.lba = nx721jLogicalFirstLba (saved, uint32_t (superFirst), uint32_t (superLast), sample.name);
-    if (!sample.lba) {
+    auto logical = nx721jLogicalExtent (saved, uint32_t (superFirst), uint32_t (superLast), sample.name);
+    if (!logical.blocks) {
       panic ("NX721J XNU invalid %s logical extent", sample.name);
     }
-    getBlock (sample.name, sample.lba);
+    getBlock (sample.name, logical.firstLba);
     uint32_t crc = nx721jBlockCrc (data, page);
-    if (data[1080] != 0x53 || data[1081] != 0xef || crc != sample.crc) {
+    const uint8_t *sb = data + 1024;
+    uint32_t fsBlocks = nx721jReadLe32 (sb + 4);
+    uint16_t inodeBytes = nx721jReadLe16 (sb + 88);
+    // This diagnostic covers the device's 32-byte group descriptors and 4 KiB blocks.
+    if (nx721jReadLe16 (sb + 56) != 0xef53 || nx721jReadLe32 (sb + 24) != 2 ||
+        nx721jReadLe32 (sb + 20) != 0 || nx721jReadLe32 (sb + 96) != 0x42 ||
+        fsBlocks < 3 || fsBlocks > logical.blocks || inodeBytes < 128 || inodeBytes > page / 2 ||
+        nx721jReadLe32 (sb + 40) < 2 || crc != sample.superblockCrc) {
       panic ("NX721J XNU %s ext4 sample DIFF\nLBA=%u CRC=%08x expected=%08x",
-             sample.name, sample.lba, crc, sample.crc);
+             sample.name, logical.firstLba, crc, sample.superblockCrc);
+    }
+
+    getBlock ("ext4 group descriptor", logical.firstLba + 1);
+    uint32_t inodeTable = nx721jReadLe32 (data + 8);
+    if (inodeTable < 2 || inodeTable >= fsBlocks) {
+      panic ("NX721J XNU %s invalid ext4 inode table\nBlock=%u", sample.name, inodeTable);
+    }
+    getBlock ("ext4 root inode", logical.firstLba + inodeTable);
+    // Inode 2 is the second entry in group 0. Its extent tree is inline on this device.
+    const uint8_t *inode = data + inodeBytes;
+    const uint8_t *tree = inode + 40;
+    uint32_t directory = nx721jReadLe32 (tree + 20);
+    uint16_t extentBlocks = nx721jReadLe16 (tree + 16);
+    if ((nx721jReadLe16 (inode) & 0xf000) != 0x4000 || nx721jReadLe32 (inode + 4) != page ||
+        !(nx721jReadLe32 (inode + 32) & 0x80000) || nx721jReadLe16 (tree) != 0xf30a ||
+        nx721jReadLe16 (tree + 2) != 1 || nx721jReadLe16 (tree + 6) != 0 ||
+        nx721jReadLe32 (tree + 12) != 0 || extentBlocks != 1 || nx721jReadLe16 (tree + 18) != 0 ||
+        directory < 2 || directory >= fsBlocks) {
+      panic ("NX721J XNU %s invalid ext4 root extent\nInode table block=%u", sample.name, inodeTable);
+    }
+    sample.directoryLba = logical.firstLba + directory;
+    getBlock ("ext4 root directory", sample.directoryLba);
+    crc = nx721jBlockCrc (data, page);
+    if (crc != sample.directoryCrc || !nx721jExt4RootEntries (data, sample.entry, sample.entryInode, sample.entryType)) {
+      panic ("NX721J XNU %s root directory DIFF\nLBA=%u CRC=%08x expected=%08x",
+             sample.name, sample.directoryLba, crc, sample.directoryCrc);
     }
   }
-  panic ("NX721J XNU logical extents PASS\nWake: %s\nGPT sweep PASS normalized=%08x\n"
-         "LP A/B main+backup MATCH CRC=455c0234\nsystem_a LBA=%u ext4 CRC=5ccb041c\n"
-         "vendor_a LBA=%u ext4 CRC=e767162f",
-         wakeResult, ~normalized, samples[0].lba, samples[1].lba);
+  panic ("NX721J XNU ext4 root directories PASS\nWake: %s\nGPT / LP metadata MATCH\n"
+         "system_a / LBA=%u CRC=b2dc8847\nsystem inode=51\n"
+         "vendor_a / LBA=%u CRC=d5515dc2\nbuild.prop inode=3836",
+         wakeResult, samples[0].directoryLba, samples[1].directoryLba);
 }
