@@ -20,6 +20,52 @@ static uint32_t nx721jReadLe32 (const uint8_t *bytes)
          (uint32_t (bytes[2]) << 16) | (uint32_t (bytes[3]) << 24);
 }
 
+struct Nx721jScsiSense {
+  unsigned segmentBytes = 0;
+  unsigned senseBytes = 0;
+  unsigned format = 0;
+  unsigned key = 0xff;
+  unsigned asc = 0xff;
+  unsigned ascq = 0xff;
+};
+
+static Nx721jScsiSense nx721jDecodeSense (const uint8_t *response, unsigned responseBytes)
+{
+  Nx721jScsiSense result;
+  constexpr unsigned senseOffset = 34;
+  if (responseBytes < senseOffset || response[0] != 0x21 || response[7] != 2) {
+    return result;
+  }
+  result.segmentBytes = (unsigned (response[10]) << 8) | response[11];
+  result.senseBytes = (unsigned (response[32]) << 8) | response[33];
+  if (result.segmentBytes <= 2 || result.senseBytes == 0 || responseBytes == senseOffset) {
+    return result;
+  }
+  unsigned available = result.segmentBytes - 2;
+  if (available > result.senseBytes) {
+    available = result.senseBytes;
+  }
+  if (available > responseBytes - senseOffset) {
+    available = responseBytes - senseOffset;
+  }
+  const uint8_t *sense = response + senseOffset;
+  result.format = sense[0] & 0x7f;
+  if (result.format == 0x70 || result.format == 0x71) {
+    if (available >= 3) {
+      result.key = sense[2] & 0xf;
+    }
+    if (available >= 14 && sense[7] >= 6) {
+      result.asc = sense[12];
+      result.ascq = sense[13];
+    }
+  } else if ((result.format == 0x72 || result.format == 0x73) && available >= 4) {
+    result.key = sense[1] & 0xf;
+    result.asc = sense[2];
+    result.ascq = sense[3];
+  }
+  return result;
+}
+
 static OSSharedPtr<IOMemoryMap> nx721jMapDma (uint64_t base, unsigned size)
 {
   IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress (base, size, kIODirectionInOut);
@@ -126,6 +172,15 @@ static bool nx721jUfsIdle (uintptr_t host, uint64_t queue)
              nx721jGptHeaderCrc (data, size) == nx721jReadLe32 (data + 16);
   bool success = !ocs && response[0] == 0x21 && !response[3] && !response[6] &&
                  !response[7] && !getBe32 (response + 12) && gpt;
+  if (!ocs && response[0] == 0x21 && response[7] == 2) {
+    Nx721jScsiSense sense = nx721jDecodeSense (response, responseOffset);
+    panic ("NX721J XNU READ(10) CHECK CONDITION\n"
+           "sense key=%02x ASC=%02x ASCQ=%02x fmt=%02x\n"
+           "sense len=%u segment=%u residual=%u\n"
+           "OCS=%02x UPIU=%02x rsp=%02x SCSI=%02x",
+           sense.key, sense.asc, sense.ascq, sense.format, sense.senseBytes, sense.segmentBytes,
+           getBe32 (response + 12), ocs, response[0], response[6], response[7]);
+  }
   panic ("NX721J XNU READ(10) %s\nLUN0 LBA1 DMA=%llx\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x GPT CRC=%s",
          success ? "PASS" : "FAIL", scratch + page, ocs, response[0], response[6], response[7], gpt ? "PASS" : "FAIL");
 }
