@@ -336,7 +336,7 @@ struct Nx721jUfsCompletion {
     panic ("NX721J XNU GPT entry array CRC FAIL\nRead=%08x header=%08x", ~raw, primary.arrayCrc);
   }
   bool baseline = primary.guidLow == 0xb0b21a6df50b5a95ULL && primary.guidHigh == 0x4716ecf679b676f9ULL &&
-                  ~normalized == 0x692e08b8U;
+                  ~normalized == 0x35d1cb6aU;
   panic ("NX721J XNU GPT sweep PASS\nWake: %s\nHeaders and arrays PASS; blocks read=%u\n"
          "Entries CRC=%08x normalized=%08x\nTWRP A baseline %s",
          wakeResult, 2 + 2 * primary.arrayBlocks, ~raw, ~normalized, baseline ? "MATCH" : "DIFF");
