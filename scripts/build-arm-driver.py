@@ -2,6 +2,7 @@
 """Compile the generic platform expert against the actual source-kernel ABI."""
 import argparse
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -44,6 +45,9 @@ if component == 'NativeUfs':
     if text.count(marker) != 1:
         raise SystemExit('NativeUfs source layout changed; passive split is unsafe')
     prefix, suffix = text.split(marker, 1)
+    read_one_source = os.environ.get('NX721J_UFS_READ_ONE_SOURCE')
+    if read_one_source:
+        prefix += '\n#define NX721J_UFS_READ_ONE 1\n' + Path(read_one_source).read_text(encoding='utf-8') + '\n'
     source = out / 'Nx721jPassiveUfs.cpp'
     source.write_text(prefix + '''
 #if defined(NATIVE_UFS_PASSIVE_ONLY) && NATIVE_UFS_PASSIVE_ONLY
@@ -55,8 +59,16 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
   native_ufs_probe_requested = probe != 0;
-  if (!nx721jRequested () || rootMode || probe != 2 ||
+  if (!nx721jRequested () || rootMode ||
       !OSDynamicCast (IOPlatformExpertDevice, provider)) {
+    return false;
+  }
+#if defined(NX721J_UFS_READ_ONE)
+  if (probe == 3) {
+    nx721jUfsReadOne ();
+  }
+#endif
+  if (probe != 2) {
     return false;
   }
   inspect ();

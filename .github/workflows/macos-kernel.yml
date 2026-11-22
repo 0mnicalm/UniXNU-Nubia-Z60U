@@ -27,6 +27,10 @@ on:
         description: Include the NX721J UFS register survey in the experimental kernel
         type: boolean
         default: false
+      ufs_read_one:
+        description: Include the opt-in NX721J LUN0 LBA1 read diagnostic
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -107,13 +111,17 @@ jobs:
           ./unixnu build kernel "${args[@]}" -D "$GITHUB_WORKSPACE"
 
       - name: Build the experimental PMGR kernel
-        if: ${{ inputs.pmgr || inputs.ufs_passive }}
+        if: ${{ inputs.pmgr || inputs.ufs_passive || inputs.ufs_read_one }}
         working-directory: unixnu
         env:
           IPSW_URL: ${{ inputs.ipsw_url }}
           GITHUB_TOKEN: ${{ github.token }}
-          UFS_PASSIVE: ${{ inputs.ufs_passive }}
+          UFS_PASSIVE: ${{ inputs.ufs_passive || inputs.ufs_read_one }}
+          UFS_READ_ONE: ${{ inputs.ufs_read_one }}
         run: |
+          if [ "$UFS_READ_ONE" = true ]; then
+            export NX721J_UFS_READ_ONE_SOURCE="$GITHUB_WORKSPACE/scripts/nx721j-ufs-read-one.inc"
+          fi
           if [ "$UFS_PASSIVE" = true ]; then
             python3 "$GITHUB_WORKSPACE/scripts/prepare-nx721j-native-ufs.py" --unixnu "$PWD"
           fi
@@ -161,7 +169,7 @@ jobs:
           fi
           python3 "$GITHUB_WORKSPACE/scripts/check-nx721j-pmgr.py" "${kernels[0]}"
           if [ "$UFS_PASSIVE" = true ]; then
-            python3 - "${kernels[0]}" <<'PY'
+            python3 - "${kernels[0]}" "$UFS_READ_ONE" <<'PY'
           from pathlib import Path
           import subprocess
           import sys
@@ -175,8 +183,11 @@ jobs:
               raise SystemExit("NX721J passive NativeUfs service missing from kernel")
           if any("NativeUfs9startRoot" in name for name in names):
               raise SystemExit("Unexpected active NativeUfs root transport in kernel")
-          if b"NATIVE_UFS NX721J passive survey: queue and DMA" not in kernel.read_bytes():
+          image = kernel.read_bytes()
+          if b"NATIVE_UFS NX721J passive survey: queue mode" not in image:
               raise SystemExit("NX721J register survey absent from kernel")
+          if (b"NX721J XNU READ(10) %s" in image) != (sys.argv[2] == "true"):
+              raise SystemExit("NX721J single-read diagnostic does not match build selection")
           PY
           fi
           llvm-nm -m --defined-only "${kernels[0]}" | awk '
