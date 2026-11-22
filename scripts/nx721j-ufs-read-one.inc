@@ -85,6 +85,12 @@ static bool nx721jGptSlotName (const uint8_t *entry)
          (name[end - 2] == 'a' || name[end - 2] == 'b');
 }
 
+static bool nx721jGptSuperName (const uint8_t *entry)
+{
+  static constexpr uint8_t name[] = {'s', 0, 'u', 0, 'p', 0, 'e', 0, 'r', 0, 0, 0};
+  return memcmp (entry + 56, name, sizeof (name)) == 0;
+}
+
 struct Nx721jScsiSense {
   unsigned segmentBytes = 0;
   unsigned senseBytes = 0;
@@ -314,6 +320,8 @@ struct Nx721jUfsCompletion {
   uint8_t *saved = data + page;
   uint32_t raw = ~0U;
   uint32_t normalized = ~0U;
+  uint64_t superFirst = 0;
+  uint64_t superLast = 0;
   for (uint32_t i = 0; i < primary.arrayBlocks; ++i) {
     uint32_t remaining = primary.arrayBytes - i * page;
     uint32_t valid = remaining < page ? remaining : page;
@@ -325,6 +333,16 @@ struct Nx721jUfsCompletion {
     }
     for (uint32_t at = 0; at < valid; at += primary.entrySize) {
       const uint8_t *entry = data + at;
+      if (nx721jGptSuperName (entry) && (nx721jReadLe64 (entry) || nx721jReadLe64 (entry + 8))) {
+        if (superFirst) {
+          panic ("NX721J XNU duplicate super GPT entry");
+        }
+        superFirst = nx721jReadLe64 (entry + 32);
+        superLast = nx721jReadLe64 (entry + 40);
+        if (superFirst < primary.firstUsable || superLast > primary.lastUsable || superLast < superFirst) {
+          panic ("NX721J XNU invalid super GPT bounds");
+        }
+      }
       bool ab = nx721jGptSlotName (entry);
       for (uint32_t byte = 0; byte < primary.entrySize; ++byte) {
         raw = nx721jCrcByte (raw, entry[byte]);
@@ -337,7 +355,40 @@ struct Nx721jUfsCompletion {
   }
   bool baseline = primary.guidLow == 0xb0b21a6df50b5a95ULL && primary.guidHigh == 0x4716ecf679b676f9ULL &&
                   ~normalized == 0x35d1cb6aU;
-  panic ("NX721J XNU GPT sweep PASS\nWake: %s\nHeaders and arrays PASS; blocks read=%u\n"
-         "Entries CRC=%08x normalized=%08x\nTWRP A baseline %s",
-         wakeResult, 2 + 2 * primary.arrayBlocks, ~raw, ~normalized, baseline ? "MATCH" : "DIFF");
+  if (!baseline || superFirst != 8968 || superLast != 3154695) {
+    panic ("NX721J XNU super GPT baseline DIFF\nEntries CRC=%08x normalized=%08x\nsuper LBA=%llu..%llu",
+           ~raw, ~normalized, (unsigned long long) superFirst, (unsigned long long) superLast);
+  }
+
+  // Android liblp places two geometry blocks after a reserved 4 KiB block,
+  // followed by the primary metadata slots at a stride of metadata_max_size.
+  constexpr uint32_t metadataMaxBytes = 65536;
+  struct SuperBlock {
+    const char *stage;
+    uint32_t offset;
+    uint32_t magic;
+    uint32_t crc;
+  };
+  constexpr SuperBlock checks[] = {
+    {"super geometry", 1, 0x616c4467, 0x59c8de0f},
+    {"super backup geometry", 2, 0x616c4467, 0x59c8de0f},
+    {"super metadata A", 3, 0x414c5030, 0xd6cea9a8},
+    {"super metadata B", 3 + metadataMaxBytes / page, 0x414c5030, 0xd6cea9a8},
+  };
+  for (const auto &block : checks) {
+    uint32_t lba = uint32_t (superFirst) + block.offset;
+    getBlock (block.stage, lba);
+    uint32_t crc = ~0U;
+    for (uint32_t at = 0; at < page; ++at) {
+      crc = nx721jCrcByte (crc, data[at]);
+    }
+    uint32_t magic = nx721jReadLe32 (data);
+    if (magic != block.magic || ~crc != block.crc) {
+      panic ("NX721J XNU %s DIFF\nLBA=%u magic=%08x\nCRC=%08x expected=%08x",
+             block.stage, lba, magic, ~crc, block.crc);
+    }
+  }
+  panic ("NX721J XNU super metadata PASS\nWake: %s\nGPT sweep PASS / TWRP A baseline MATCH\n"
+         "super LBA=%u / 4 blocks MATCH\nGeometry CRC=59c8de0f\nSlot A/B CRC=d6cea9a8",
+         wakeResult, uint32_t (superFirst));
 }
