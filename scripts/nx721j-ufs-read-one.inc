@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Included into the NX721J diagnostic service after the NativeUfs helpers.
 
+static uint32_t nx721jCrcByte (uint32_t crc, uint8_t value)
+{
+  crc ^= value;
+  for (unsigned bit = 0; bit < 8; ++bit) {
+    crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320U : 0);
+  }
+  return crc;
+}
+
 static uint32_t nx721jGptHeaderCrc (const uint8_t *bytes, uint32_t length)
 {
   uint32_t crc = ~0U;
   for (uint32_t offset = 0; offset < length; ++offset) {
     uint8_t value = offset >= 16 && offset < 20 ? 0 : bytes[offset];
-    crc ^= value;
-    for (unsigned bit = 0; bit < 8; ++bit) {
-      crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320U : 0);
-    }
+    crc = nx721jCrcByte (crc, value);
   }
   return ~crc;
 }
@@ -18,6 +24,65 @@ static uint32_t nx721jReadLe32 (const uint8_t *bytes)
 {
   return uint32_t (bytes[0]) | (uint32_t (bytes[1]) << 8) |
          (uint32_t (bytes[2]) << 16) | (uint32_t (bytes[3]) << 24);
+}
+
+static uint64_t nx721jReadLe64 (const uint8_t *bytes)
+{
+  return nx721jReadLe32 (bytes) | (uint64_t (nx721jReadLe32 (bytes + 4)) << 32);
+}
+
+struct Nx721jGptHeader {
+  uint64_t firstUsable;
+  uint64_t lastUsable;
+  uint64_t arrayLba;
+  uint64_t guidLow;
+  uint64_t guidHigh;
+  uint32_t entryCount;
+  uint32_t entrySize;
+  uint32_t arrayCrc;
+  uint32_t arrayBytes;
+  uint32_t arrayBlocks;
+};
+
+static constexpr uint32_t nx721jLun0LastLba = 124002303;
+static constexpr uint32_t nx721jLun0BlockBytes = 4096;
+
+static bool nx721jParseGpt (const uint8_t *block, bool primary, Nx721jGptHeader &header)
+{
+  uint32_t size = nx721jReadLe32 (block + 12);
+  if (memcmp (block, "EFI PART", 8) || nx721jReadLe32 (block + 8) != 0x10000 ||
+      size < 92 || size > nx721jLun0BlockBytes || nx721jReadLe32 (block + 20) != 0 ||
+      nx721jReadLe64 (block + 24) != (primary ? 1U : nx721jLun0LastLba) ||
+      nx721jReadLe64 (block + 32) != (primary ? nx721jLun0LastLba : 1U) ||
+      nx721jGptHeaderCrc (block, size) != nx721jReadLe32 (block + 16)) {
+    return false;
+  }
+  header = {nx721jReadLe64 (block + 40), nx721jReadLe64 (block + 48), nx721jReadLe64 (block + 72),
+            nx721jReadLe64 (block + 56), nx721jReadLe64 (block + 64), nx721jReadLe32 (block + 80),
+            nx721jReadLe32 (block + 84), nx721jReadLe32 (block + 88), 0, 0};
+  uint64_t arrayBytes = uint64_t (header.entryCount) * header.entrySize;
+  if (header.entrySize < 128 || header.entrySize > nx721jLun0BlockBytes ||
+      (header.entrySize & (header.entrySize - 1)) || !arrayBytes || arrayBytes > 64 * nx721jLun0BlockBytes ||
+      header.firstUsable < 2 || header.firstUsable > header.lastUsable ||
+      header.lastUsable >= nx721jLun0LastLba || header.arrayLba < 2 || header.arrayLba >= nx721jLun0LastLba) {
+    return false;
+  }
+  header.arrayBytes = uint32_t (arrayBytes);
+  header.arrayBlocks = (header.arrayBytes + nx721jLun0BlockBytes - 1) / nx721jLun0BlockBytes;
+  uint64_t arrayEnd = header.arrayLba + header.arrayBlocks;
+  return primary ? arrayEnd <= header.firstUsable :
+                   header.arrayLba > header.lastUsable && arrayEnd <= nx721jLun0LastLba;
+}
+
+static bool nx721jGptSlotName (const uint8_t *entry)
+{
+  const uint8_t *name = entry + 56;
+  unsigned end = 0;
+  while (end < 72 && (name[end] || name[end + 1])) {
+    end += 2;
+  }
+  return end >= 4 && name[end - 4] == '_' && !name[end - 3] && !name[end - 1] &&
+         (name[end - 2] == 'a' || name[end - 2] == 'b');
 }
 
 struct Nx721jScsiSense {
@@ -110,7 +175,7 @@ struct Nx721jUfsCompletion {
 
 [[noreturn]] static void nx721jUfsReadOne ()
 {
-  constexpr unsigned page = 4096;
+  constexpr unsigned page = nx721jLun0BlockBytes;
   constexpr unsigned scratchBytes = 16384;
   constexpr unsigned slotBytes = 32;
   constexpr unsigned responseOffset = 512;
@@ -191,8 +256,12 @@ struct Nx721jUfsCompletion {
     return result;
   };
 
-  const uint8_t read10[] = {0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0};
-  Nx721jUfsCompletion read = submit ("READ(10)", 0, read10, sizeof (read10), true, 10000);
+  auto readBlock = [&] (const char *stage, uint32_t lba) {
+    uint8_t cdb[] = {0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    be32 (cdb + 2, lba);
+    return submit (stage, 0, cdb, sizeof (cdb), true, 10000);
+  };
+  Nx721jUfsCompletion read = readBlock ("READ(10)", 1);
   const char *wakeResult = "skipped";
   if (read.needsInitialization ()) {
     const uint8_t active[] = {0x1b, 0, 0, 0, 0x10, 0};
@@ -210,13 +279,9 @@ struct Nx721jUfsCompletion {
              tur.ocs, tur.type, tur.response, tur.status, tur.sense.key, tur.sense.asc, tur.sense.ascq);
     }
     wakeResult = "ACTIVE PASS / TUR PASS";
-    read = submit ("READ(10) retry", 0, read10, sizeof (read10), true, 10000);
+    read = readBlock ("READ(10) retry", 1);
   }
 
-  uint32_t size = nx721jReadLe32 (data + 12);
-  bool gpt = read.good () && size >= 92 && size <= page && memcmp (data, "EFI PART", 8) == 0 &&
-             nx721jReadLe32 (data + 24) == 1 && nx721jReadLe32 (data + 28) == 0 &&
-             nx721jGptHeaderCrc (data, size) == nx721jReadLe32 (data + 16);
   if (!read.ocs && read.type == 0x21 && read.status == 2) {
     panic ("NX721J XNU READ(10) CHECK CONDITION\n"
            "Wake: %s\n"
@@ -225,7 +290,54 @@ struct Nx721jUfsCompletion {
            wakeResult, read.sense.key, read.sense.asc, read.sense.ascq, read.sense.format,
            read.ocs, read.type, read.response, read.status);
   }
-  panic ("NX721J XNU READ(10) %s\nWake: %s\nLUN0 LBA1 DMA=%llx\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x GPT CRC=%s",
-         gpt ? "PASS" : "FAIL", wakeResult, scratch + page, read.ocs, read.type, read.response, read.status,
-         !read.good () ? "SKIP" : gpt ? "PASS" : "FAIL");
+  Nx721jGptHeader primary, backup;
+  if (!read.good () || !nx721jParseGpt (data, true, primary)) {
+    panic ("NX721J XNU READ(10) %s\nWake: %s\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x primary GPT invalid",
+           "FAIL", wakeResult, read.ocs, read.type, read.response, read.status);
+  }
+  auto getBlock = [&] (const char *stage, uint32_t lba) {
+    Nx721jUfsCompletion done = readBlock (stage, lba);
+    if (!done.good ()) {
+      panic ("NX721J XNU GPT %s read failed LBA=%u\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x\nsense=%02x/%02x/%02x",
+             stage, lba, done.ocs, done.type, done.response, done.status, done.sense.key, done.sense.asc, done.sense.ascq);
+    }
+  };
+  getBlock ("backup header", nx721jLun0LastLba);
+  if (!nx721jParseGpt (data, false, backup) || primary.guidLow != backup.guidLow || primary.guidHigh != backup.guidHigh ||
+      primary.firstUsable != backup.firstUsable || primary.lastUsable != backup.lastUsable ||
+      primary.entryCount != backup.entryCount || primary.entrySize != backup.entrySize || primary.arrayCrc != backup.arrayCrc) {
+    panic ("NX721J XNU GPT backup header invalid or disagrees\nWake: %s", wakeResult);
+  }
+
+  // The third scratch page is CPU-only. Save each primary block there before
+  // the next READ(10) reuses the tested DMA buffer for the backup block.
+  uint8_t *saved = data + page;
+  uint32_t raw = ~0U;
+  uint32_t normalized = ~0U;
+  for (uint32_t i = 0; i < primary.arrayBlocks; ++i) {
+    uint32_t remaining = primary.arrayBytes - i * page;
+    uint32_t valid = remaining < page ? remaining : page;
+    getBlock ("primary entries", uint32_t (primary.arrayLba) + i);
+    memcpy (saved, data, valid);
+    getBlock ("backup entries", uint32_t (backup.arrayLba) + i);
+    if (memcmp (saved, data, valid) != 0) {
+      panic ("NX721J XNU GPT primary and backup entries differ\nArray block %u", i);
+    }
+    for (uint32_t at = 0; at < valid; at += primary.entrySize) {
+      const uint8_t *entry = data + at;
+      bool ab = nx721jGptSlotName (entry);
+      for (uint32_t byte = 0; byte < primary.entrySize; ++byte) {
+        raw = nx721jCrcByte (raw, entry[byte]);
+        normalized = nx721jCrcByte (normalized, ab && byte == 54 ? 0 : entry[byte]);
+      }
+    }
+  }
+  if (~raw != primary.arrayCrc) {
+    panic ("NX721J XNU GPT entry array CRC FAIL\nRead=%08x header=%08x", ~raw, primary.arrayCrc);
+  }
+  bool baseline = primary.guidLow == 0xb0b21a6df50b5a95ULL && primary.guidHigh == 0x4716ecf679b676f9ULL &&
+                  ~normalized == 0x692e08b8U;
+  panic ("NX721J XNU GPT sweep PASS\nWake: %s\nHeaders and arrays PASS; blocks read=%u\n"
+         "Entries CRC=%08x normalized=%08x\nTWRP A baseline %s",
+         wakeResult, 2 + 2 * primary.arrayBlocks, ~raw, ~normalized, baseline ? "MATCH" : "DIFF");
 }
