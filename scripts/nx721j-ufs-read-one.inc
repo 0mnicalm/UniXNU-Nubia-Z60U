@@ -353,8 +353,9 @@ struct Nx721jUfsCompletion {
   if (~raw != primary.arrayCrc) {
     panic ("NX721J XNU GPT entry array CRC FAIL\nRead=%08x header=%08x", ~raw, primary.arrayCrc);
   }
+  // TWRP has observed both normalized layout CRCs; super has the same bounds in both.
   bool baseline = primary.guidLow == 0xb0b21a6df50b5a95ULL && primary.guidHigh == 0x4716ecf679b676f9ULL &&
-                  ~normalized == 0x35d1cb6aU;
+                  (~normalized == 0x35d1cb6aU || ~normalized == 0x692e08b8U);
   if (!baseline || superFirst != 8968 || superLast != 3154695) {
     panic ("NX721J XNU super GPT baseline DIFF\nEntries CRC=%08x normalized=%08x\nsuper LBA=%llu..%llu",
            ~raw, ~normalized, (unsigned long long) superFirst, (unsigned long long) superLast);
@@ -388,7 +389,7 @@ struct Nx721jUfsCompletion {
              block.stage, lba, magic, ~crc, block.crc);
     }
   }
-  panic ("NX721J XNU super metadata PASS\nWake: %s\nGPT sweep PASS / TWRP A baseline MATCH\n"
+  panic ("NX721J XNU super metadata PASS\nWake: %s\nGPT sweep PASS normalized=%08x\n"
          "super LBA=%u / 4 blocks MATCH\nGeometry CRC=59c8de0f\nSlot A/B CRC=d6cea9a8",
-         wakeResult, uint32_t (superFirst));
+         wakeResult, ~normalized, uint32_t (superFirst));
 }
