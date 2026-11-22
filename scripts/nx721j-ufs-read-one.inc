@@ -89,6 +89,25 @@ static bool nx721jUfsIdle (uintptr_t host, uint64_t queue)
          read32 (host, 0x24) == 0 && read32 (host, 0x58) == 0 && read32 (host, 0x78) == 0;
 }
 
+struct Nx721jUfsCompletion {
+  uint32_t ocs;
+  unsigned type;
+  unsigned tag;
+  unsigned response;
+  unsigned status;
+  uint32_t residual;
+  Nx721jScsiSense sense;
+
+  bool good () const {
+    return ocs == 0 && type == 0x21 && tag == 0 && response == 0 && status == 0 && residual == 0;
+  }
+
+  bool needsInitialization () const {
+    return ocs == 0 && type == 0x21 && tag == 0 && status == 2 &&
+           sense.key == 2 && sense.asc == 4 && sense.ascq == 2;
+  }
+};
+
 [[noreturn]] static void nx721jUfsReadOne ()
 {
   constexpr unsigned page = 4096;
@@ -123,64 +142,90 @@ static bool nx721jUfsIdle (uintptr_t host, uint64_t queue)
   auto *prd = reinterpret_cast<uint32_t *> (command + prdtOffset);
   uint32_t previous[slotBytes / sizeof (uint32_t)];
 
-  zero32 (command, 2 * page);
-  command[0] = 0x01;            // Command UPIU, task tag and LUN 0.
-  command[1] = 0x40;            // Device-to-host data.
-  be32 (command + 12, page);
-  command[16] = 0x28;          // READ(10), LBA 1, one logical block.
-  command[21] = 1;
-  command[24] = 1;
-  prd[0] = uint32_t (scratch + page);
-  prd[3] = page - 1;
-  cacheCleanInvalidate (command, 2 * page);
+  auto submit = [&] (const char *stage, uint8_t lun, const uint8_t *cdb, unsigned cdbBytes,
+                     bool readBlock, unsigned polls) -> Nx721jUfsCompletion {
+    zero32 (command, 2 * page);
+    command[0] = 0x01; // Command UPIU, task tag 0.
+    command[2] = lun;
+    memcpy (command + 16, cdb, cdbBytes);
+    if (readBlock) {
+      command[1] = 0x40;
+      be32 (command + 12, page);
+      prd[0] = uint32_t (scratch + page);
+      prd[3] = page - 1;
+    }
+    cacheCleanInvalidate (command, 2 * page);
 
-  if (!nx721jUfsIdle (host, queue)) {
-    panic ("NX721J XNU READ(10): inherited queue became busy");
-  }
-  cacheCleanInvalidate (utrd, slotBytes);
-  memcpy (previous, utrd, sizeof (previous));
-  zero32 (utrd, slotBytes);
-  utrd[0] = 0x15000000U;       // Native UFS command, device to host, interrupt command.
-  utrd[2] = 0x0fU;             // OCS invalid until completion.
-  utrd[4] = uint32_t (scratch);
-  utrd[6] = (responseOffset / 4) | ((responseOffset / 4) << 16);
-  utrd[7] = 1U | ((prdtOffset / 4) << 16);
-  cacheCleanInvalidate (utrd, slotBytes);
-  write32 (host, 0x58, 1);     // Submit only slot 0. The firmware left IE disabled.
-  __asm__ volatile ("dsb sy" ::: "memory");
+    if (!nx721jUfsIdle (host, queue)) {
+      panic ("NX721J XNU UFS %s: inherited queue became busy", stage);
+    }
+    cacheCleanInvalidate (utrd, slotBytes);
+    memcpy (previous, utrd, sizeof (previous));
+    zero32 (utrd, slotBytes);
+    utrd[0] = readBlock ? 0x15000000U : 0x11000000U;
+    utrd[2] = 0x0fU;
+    utrd[4] = uint32_t (scratch);
+    utrd[6] = (responseOffset / 4) | ((responseOffset / 4) << 16);
+    utrd[7] = (prdtOffset / 4) << 16 | (readBlock ? 1U : 0U);
+    cacheCleanInvalidate (utrd, slotBytes);
+    write32 (host, 0x58, 1); // Submit only slot 0. Interrupts remain disabled.
+    __asm__ volatile ("dsb sy" ::: "memory");
 
-  unsigned polls = 10000;
-  while ((read32 (host, 0x58) & 1) && polls) {
-    --polls;
-    IODelay (10);
-  }
-  if (read32 (host, 0x58) & 1) {
-    // Leave all DMA buffers and the submitted descriptor intact on timeout.
-    panic ("NX721J XNU READ(10): timeout IS=%08x HCS=%08x DB=%08x",
-           read32 (host, 0x20), read32 (host, 0x30), read32 (host, 0x58));
+    while ((read32 (host, 0x58) & 1) && polls) {
+      --polls;
+      IODelay (10);
+    }
+    if (read32 (host, 0x58) & 1) {
+      // Leave the in-flight descriptor and both buffers intact on timeout.
+      panic ("NX721J XNU UFS %s: timeout IS=%08x HCS=%08x DB=%08x",
+             stage, read32 (host, 0x20), read32 (host, 0x30), read32 (host, 0x58));
+    }
+
+    cacheCleanInvalidate (utrd, slotBytes);
+    cacheCleanInvalidate (command, 2 * page);
+    const uint8_t *response = command + responseOffset;
+    Nx721jUfsCompletion result = {utrd[2] & 0xff, response[0], response[3], response[6], response[7],
+                                  getBe32 (response + 12), nx721jDecodeSense (response, responseOffset)};
+    memcpy (utrd, previous, sizeof (previous));
+    cacheClean (utrd, slotBytes);
+    return result;
+  };
+
+  const uint8_t read10[] = {0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0};
+  Nx721jUfsCompletion read = submit ("READ(10)", 0, read10, sizeof (read10), true, 10000);
+  const char *wakeResult = "skipped";
+  if (read.needsInitialization ()) {
+    const uint8_t active[] = {0x1b, 0, 0, 0, 0x10, 0};
+    Nx721jUfsCompletion wake = submit ("START STOP ACTIVE", 0xd0, active, sizeof (active), false, 1000000);
+    if (!wake.good ()) {
+      panic ("NX721J UFS START STOP ACTIVE FAIL\n"
+             "Initial READ sense=02/04/02\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x\nsense=%02x/%02x/%02x",
+             wake.ocs, wake.type, wake.response, wake.status, wake.sense.key, wake.sense.asc, wake.sense.ascq);
+    }
+    const uint8_t ready[] = {0, 0, 0, 0, 0, 0};
+    Nx721jUfsCompletion tur = submit ("TEST UNIT READY", 0, ready, sizeof (ready), false, 100000);
+    if (!tur.good ()) {
+      panic ("NX721J UFS TEST UNIT READY FAIL\n"
+             "START STOP ACTIVE PASS\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x\nsense=%02x/%02x/%02x",
+             tur.ocs, tur.type, tur.response, tur.status, tur.sense.key, tur.sense.asc, tur.sense.ascq);
+    }
+    wakeResult = "ACTIVE PASS / TUR PASS";
+    read = submit ("READ(10) retry", 0, read10, sizeof (read10), true, 10000);
   }
 
-  cacheCleanInvalidate (utrd, slotBytes);
-  cacheCleanInvalidate (command, 2 * page);
-  uint32_t ocs = utrd[2] & 0xff;
-  memcpy (utrd, previous, sizeof (previous));
-  cacheClean (utrd, slotBytes);
-  const uint8_t *response = command + responseOffset;
   uint32_t size = nx721jReadLe32 (data + 12);
-  bool gpt = size >= 92 && size <= page && memcmp (data, "EFI PART", 8) == 0 &&
+  bool gpt = read.good () && size >= 92 && size <= page && memcmp (data, "EFI PART", 8) == 0 &&
              nx721jReadLe32 (data + 24) == 1 && nx721jReadLe32 (data + 28) == 0 &&
              nx721jGptHeaderCrc (data, size) == nx721jReadLe32 (data + 16);
-  bool success = !ocs && response[0] == 0x21 && !response[3] && !response[6] &&
-                 !response[7] && !getBe32 (response + 12) && gpt;
-  if (!ocs && response[0] == 0x21 && response[7] == 2) {
-    Nx721jScsiSense sense = nx721jDecodeSense (response, responseOffset);
+  if (!read.ocs && read.type == 0x21 && read.status == 2) {
     panic ("NX721J XNU READ(10) CHECK CONDITION\n"
+           "Wake: %s\n"
            "sense key=%02x ASC=%02x ASCQ=%02x fmt=%02x\n"
-           "sense len=%u segment=%u residual=%u\n"
            "OCS=%02x UPIU=%02x rsp=%02x SCSI=%02x",
-           sense.key, sense.asc, sense.ascq, sense.format, sense.senseBytes, sense.segmentBytes,
-           getBe32 (response + 12), ocs, response[0], response[6], response[7]);
+           wakeResult, read.sense.key, read.sense.asc, read.sense.ascq, read.sense.format,
+           read.ocs, read.type, read.response, read.status);
   }
-  panic ("NX721J XNU READ(10) %s\nLUN0 LBA1 DMA=%llx\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x GPT CRC=%s",
-         success ? "PASS" : "FAIL", scratch + page, ocs, response[0], response[6], response[7], gpt ? "PASS" : "FAIL");
+  panic ("NX721J XNU READ(10) %s\nWake: %s\nLUN0 LBA1 DMA=%llx\nOCS=%02x UPIU=%02x rsp=%02x SCSI=%02x GPT CRC=%s",
+         gpt ? "PASS" : "FAIL", wakeResult, scratch + page, read.ocs, read.type, read.response, read.status,
+         !read.good () ? "SKIP" : gpt ? "PASS" : "FAIL");
 }
