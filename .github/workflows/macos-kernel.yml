@@ -238,18 +238,23 @@ jobs:
         if: ${{ inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
         working-directory: unixnu
         run: |
+          set -o pipefail
           shopt -s nullglob
           trees=(out/*/tree)
-          if [ "${#trees[@]}" -ne 1 ]; then
-            echo "Expected one XNU build tree" >&2
+          kernels=(out/*/kernel/kernel.macho)
+          if [ "${#trees[@]}" -ne 1 ] || [ "${#kernels[@]}" -ne 1 ]; then
+            echo "Expected one XNU build tree and prelinked kernel" >&2
             exit 1
           fi
           tree="${trees[0]}"
           python3 "$tree/scripts/build-arm-driver.py" Nx721jUsbBlock
-          llvm-nm --defined-only --just-symbol-name "$tree/build/nx721j-usb-block/Nx721jUsbBlock.o" \
+          driver="$tree/build/nx721j-usb-block"
+          llvm-nm --defined-only --just-symbol-name "$driver/Nx721jUsbBlock.o" \
             | awk '$0 == "_nx721j_usb_publish_transport" { found=1 } END { exit !found }'
+          python3 "$GITHUB_WORKSPACE/scripts/check-nx721j-usb-block-imports.py" \
+            "$driver/Nx721jUsbBlock.o" "${kernels[0]}" | tee "$driver/imports.log"
 
-      - name: Upload USB block object and compiler log
+      - name: Upload USB block object and build logs
         if: ${{ always() && (inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block') }}
         uses: actions/upload-artifact@v4
         with:
@@ -258,6 +263,7 @@ jobs:
             unixnu/out/*/tree/build/nx721j-usb-block/Nx721jUsbBlock.o
             unixnu/out/*/tree/build/nx721j-usb-block/libNx721jUsbBlock.a
             unixnu/out/*/tree/build/nx721j-usb-block/compile.log
+            unixnu/out/*/tree/build/nx721j-usb-block/imports.log
           if-no-files-found: ignore
           retention-days: 7
 
