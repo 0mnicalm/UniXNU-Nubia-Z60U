@@ -90,7 +90,9 @@ public:
   {
     IOLockLock(gate);
     *present = online;
-    *changed = false;
+    if (changed) {
+      *changed = false;
+    }
     IOLockUnlock(gate);
     return kIOReturnSuccess;
   }
@@ -103,7 +105,7 @@ public:
     return active ? kIOReturnSuccess : kIOReturnNotReady;
   }
 
-  IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override
+  IOReturn doSynchronize(UInt64, UInt64, IOStorageSynchronizeOptions) override
   {
     return doSynchronizeCache();
   }
