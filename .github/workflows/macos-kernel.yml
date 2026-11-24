@@ -49,7 +49,7 @@ env:
 
 jobs:
   kernel:
-    runs-on: macos-latest
+    runs-on: ${{ github.ref == 'refs/heads/codex/nx721j-usb-block' && 'macos-26' || 'macos-latest' }}
     timeout-minutes: 360
     steps:
       - name: Checkout NX721J device repository
