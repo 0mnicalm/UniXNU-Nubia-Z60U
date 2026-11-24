@@ -106,7 +106,11 @@ class Nx721jDefconfigTests(unittest.TestCase):
         self.assertIn("ufs_passive:\n", baseline)
         self.assertNotIn("prepare-nx721j-native-ufs.py", baseline)
         self.assertRegex(experiment, r'if \[ "\$UFS_PASSIVE" = true \]; then\n\s+python3 "[^"]+/prepare-nx721j-native-ufs\.py"')
-        self.assertNotIn("IOStorageFamily", workflow)
+        baseline_inputs, usb_experiment = workflow.split("- name: Fetch the USB block storage headers", 1)
+        self.assertNotIn("IOStorageFamily", baseline_inputs)
+        header_step = usb_experiment.split("- name: Build kernel", 1)[0]
+        self.assertIn("inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block'", header_step)
+        self.assertIn("./unixnu fetch IOStorageFamily", header_step)
 
     def test_payload_workflow_continues_without_reset_and_passes_no_ufs_args(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "macos-nx721j-payload.yml").read_text(encoding="utf-8")

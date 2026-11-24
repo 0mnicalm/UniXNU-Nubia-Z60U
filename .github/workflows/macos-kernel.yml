@@ -31,6 +31,10 @@ on:
         description: Include the opt-in NX721J LUN0 LBA1 read diagnostic
         type: boolean
         default: false
+      usb_block:
+        description: Compile the independent NX721J USB block driver object
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -99,6 +103,11 @@ jobs:
         run: |
           ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread \
             corecrypto-2023 -D "$GITHUB_WORKSPACE"
+
+      - name: Fetch the USB block storage headers
+        if: ${{ inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
+        working-directory: unixnu
+        run: ./unixnu fetch IOStorageFamily -D "$GITHUB_WORKSPACE"
 
       - name: Build kernel
         working-directory: unixnu
@@ -224,6 +233,33 @@ jobs:
                 exit 1
               }
             }'
+
+      - name: Compile the NX721J USB block component
+        if: ${{ inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
+        working-directory: unixnu
+        run: |
+          shopt -s nullglob
+          trees=(out/*/tree)
+          if [ "${#trees[@]}" -ne 1 ]; then
+            echo "Expected one XNU build tree" >&2
+            exit 1
+          fi
+          tree="${trees[0]}"
+          python3 "$tree/scripts/build-arm-driver.py" Nx721jUsbBlock
+          llvm-nm --defined-only --just-symbol-name "$tree/build/nx721j-usb-block/Nx721jUsbBlock.o" \
+            | awk '$0 == "_nx721j_usb_publish_transport" { found=1 } END { exit !found }'
+
+      - name: Upload USB block object and compiler log
+        if: ${{ always() && (inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nx721j-usb-block-${{ github.run_number }}
+          path: |
+            unixnu/out/*/tree/build/nx721j-usb-block/Nx721jUsbBlock.o
+            unixnu/out/*/tree/build/nx721j-usb-block/libNx721jUsbBlock.a
+            unixnu/out/*/tree/build/nx721j-usb-block/compile.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload kernel output and logs
         uses: actions/upload-artifact@v4
