@@ -157,7 +157,7 @@ IOService *nx721j_usb_publish_block(IOService *provider, UInt64 blocks,
   if (!device) {
     return nullptr;
   }
-  if (!device->init() || !device->configure(blocks, reader, context) || !device->attach(provider)) {
+  if (!device->init(nullptr) || !device->configure(blocks, reader, context) || !device->attach(provider)) {
     device->release();
     return nullptr;
   }
