@@ -254,6 +254,62 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/check-nx721j-usb-block-imports.py" \
             "$driver/Nx721jUsbBlock.o" "${kernels[0]}" | tee "$driver/imports.log"
 
+      - name: Link and verify the NX721J USB block component
+        if: ${{ inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
+        working-directory: unixnu
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          drivers=(out/*/tree/build/nx721j-usb-block)
+          kernels=(out/*/kernel/kernel.macho)
+          if [ "${#drivers[@]}" -ne 1 ] || [ "${#kernels[@]}" -ne 1 ]; then
+            echo "Expected one USB driver and one baseline kernel" >&2
+            exit 1
+          fi
+          driver="$PWD/${drivers[0]}"
+          tree="$(dirname "$(dirname "$driver")")"
+          kernel="${kernels[0]}"
+          audit="$GITHUB_WORKSPACE/scripts/audit-nx721j-usb-storage-abi.py"
+          audit_args=("$driver/Nx721jUsbBlock.o" "$kernel" --native-prelink "$tree/kits/NativePrelink")
+          python3 "$audit" "${audit_args[@]}" > "$driver/storage-abi.json"
+          python3 - "$driver" "$GITHUB_WORKSPACE/configs/nx721j_probe_defconfig" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          driver, config = map(Path, sys.argv[1:])
+          symbols = json.loads((driver / "storage-abi.json").read_text())["static_bindings"]
+          (driver / "storage-bindings.S").write_text(
+              "".join(f".globl {name}\n.set {name}, {address}\n" for name, address in symbols.items())
+          )
+          text = config.read_text()
+          config_lines = text.splitlines()
+          option = "CONFIG_XNU_EXTRA_LD_ARCHIVES="
+          entries = [line for line in config_lines if line.startswith(option)]
+          if len(entries) != 1 or not entries[0].endswith('"'):
+              raise SystemExit("Expected one extra linker archive option")
+          archive = "{tree}/build/nx721j-usb-block/libNx721jUsbBlockLinked.a"
+          config.write_text(text.replace(
+              entries[0], entries[0][:-1] + f" -Wl,-force_load,{archive}" + '"'
+          ))
+          PY
+          xcrun clang -target arm64-apple-ios17.0 -c "$driver/storage-bindings.S" -o "$driver/storage-bindings.o"
+          xcrun ar rcs "$driver/libNx721jUsbBlockLinked.a" "$driver/Nx721jUsbBlock.o" "$driver/storage-bindings.o"
+
+          baseline="$(mktemp -d)"
+          cp "$kernel" "${kernel%.macho}.json" "$baseline/"
+          trap 'cp "$baseline/kernel.macho" "$baseline/kernel.json" "$(dirname "$kernel")/"' EXIT
+          rm "$tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+          ./unixnu defconfig nx721j_probe_defconfig -D "$GITHUB_WORKSPACE"
+          args=()
+          if [ -n "$IPSW_URL" ]; then args+=(--ipsw "$IPSW_URL"); fi
+          ./unixnu build kernel "${args[@]}" -D "$GITHUB_WORKSPACE"
+          python3 "$audit" "${audit_args[@]}" --linked > "$driver/linked-storage-abi.json"
+          cp "$kernel" "$driver/kernel-usb-link-check.macho"
+          cp "${kernel%.macho}.json" "$driver/kernel-usb-link-check.json"
+
       - name: Upload USB block object and build logs
         if: ${{ always() && (inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block') }}
         uses: actions/upload-artifact@v4
@@ -264,6 +320,9 @@ jobs:
             unixnu/out/*/tree/build/nx721j-usb-block/libNx721jUsbBlock.a
             unixnu/out/*/tree/build/nx721j-usb-block/compile.log
             unixnu/out/*/tree/build/nx721j-usb-block/imports.log
+            unixnu/out/*/tree/build/nx721j-usb-block/storage-abi.json
+            unixnu/out/*/tree/build/nx721j-usb-block/linked-storage-abi.json
+            unixnu/out/*/tree/build/nx721j-usb-block/kernel-usb-link-check.*
           if-no-files-found: ignore
           retention-days: 7
 
