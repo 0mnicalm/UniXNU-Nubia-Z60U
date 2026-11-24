@@ -120,13 +120,13 @@ jobs:
           ./unixnu build kernel "${args[@]}" -D "$GITHUB_WORKSPACE"
 
       - name: Build the experimental PMGR kernel
-        if: ${{ inputs.pmgr || inputs.ufs_passive || inputs.ufs_read_one }}
+        if: ${{ inputs.pmgr || inputs.ufs_passive || inputs.ufs_read_one || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
         working-directory: unixnu
         env:
           IPSW_URL: ${{ inputs.ipsw_url }}
           GITHUB_TOKEN: ${{ github.token }}
-          UFS_PASSIVE: ${{ inputs.ufs_passive || inputs.ufs_read_one }}
-          UFS_READ_ONE: ${{ inputs.ufs_read_one }}
+          UFS_PASSIVE: ${{ inputs.ufs_passive || inputs.ufs_read_one || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
+          UFS_READ_ONE: ${{ inputs.ufs_read_one || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
         run: |
           if [ "$UFS_READ_ONE" = true ]; then
             export NX721J_UFS_READ_ONE_SOURCE="$GITHUB_WORKSPACE/scripts/nx721j-ufs-read-one.inc"
@@ -260,7 +260,11 @@ jobs:
         env:
           IPSW_URL: ${{ inputs.ipsw_url }}
           GITHUB_TOKEN: ${{ github.token }}
+          UFS_READ_ONE: ${{ inputs.ufs_read_one || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
         run: |
+          if [ "$UFS_READ_ONE" = true ]; then
+            export NX721J_UFS_READ_ONE_SOURCE="$GITHUB_WORKSPACE/scripts/nx721j-ufs-read-one.inc"
+          fi
           shopt -s nullglob
           drivers=(out/*/tree/build/nx721j-usb-block)
           kernels=(out/*/kernel/kernel.macho)
@@ -307,6 +311,18 @@ jobs:
           if [ -n "$IPSW_URL" ]; then args+=(--ipsw "$IPSW_URL"); fi
           ./unixnu build kernel "${args[@]}" -D "$GITHUB_WORKSPACE"
           python3 "$audit" "${audit_args[@]}" --linked > "$driver/linked-storage-abi.json"
+          if [ "$GITHUB_REF" = refs/heads/codex/nx721j-usb-block ]; then
+            set -o pipefail
+            llvm-nm --defined-only --just-symbol-name "$kernel" | awk '
+              $0 == "__ZN9NativeUfs5startEP9IOService" { start=1 }
+              $0 == "__ZL16nx721jUfsReadOnev" { probe=1 }
+              END {
+                if (!start || !probe) {
+                  print "Missing NX721J runtime probe hook or probe body" > "/dev/stderr"
+                  exit 1
+                }
+              }'
+          fi
           cp "$kernel" "$driver/kernel-usb-link-check.macho"
           cp "${kernel%.macho}.json" "$driver/kernel-usb-link-check.json"
 
