@@ -4,7 +4,9 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IORegistryEntry.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <libkern/c++/OSString.h>
 
 namespace {
 constexpr UInt64 blockBytes = 4096;
@@ -17,7 +19,43 @@ enum ProbePhase : UInt32 {
   kProbeReadCompleted,
   kProbeDetached,
   kProbeDetachPending,
+  kProbeGptScheme,
+  kProbeApfsPartition,
+  kProbeApfsContainer,
+  kProbeApfsVolume,
+  kProbeApfsBsdName,
 };
+
+UInt32 storageTopology(IOService *device)
+{
+  UInt32 seen = 0;
+  auto entries = IORegistryIterator::iterateOver(device, gIOServicePlane, kIORegistryIterateRecursively);
+  if (!entries) {
+    return seen;
+  }
+  while (auto *entry = entries->getNextObject()) {
+    if (entry->metaCast("IOGUIDPartitionScheme")) {
+      seen |= 1U << kProbeGptScheme;
+    }
+    if (entry->metaCast("IOMedia")) {
+      auto hint = entry->copyProperty("Content Hint");
+      auto *type = OSDynamicCast(OSString, hint.get());
+      if (type && type->isEqualTo("7C3457EF-0000-11AA-AA11-00306543ECAC")) {
+        seen |= 1U << kProbeApfsPartition;
+      }
+    }
+    if (entry->metaCast("AppleAPFSContainerScheme") || entry->metaCast("AppleAPFSContainer")) {
+      seen |= 1U << kProbeApfsContainer;
+    }
+    if (entry->metaCast("AppleAPFSVolume")) {
+      seen |= 1U << kProbeApfsVolume;
+      if (entry->copyProperty("BSD Name")) {
+        seen |= 1U << kProbeApfsBsdName;
+      }
+    }
+  }
+  return entries->isValid() ? seen : 0;
+}
 }
 
 class Nx721jUsbBlock : public IOBlockStorageDevice {
@@ -78,10 +116,15 @@ public:
     IOLockUnlock(gate);
   }
 
-  bool reportProbeProgress(Nx721jUsbBlockTransport &transport)
+  bool reportProbeProgress(Nx721jUsbBlockTransport &transport, UInt32 topology)
   {
     IOLockLock(gate);
-    const bool reported = online && transport.report(completedRead ? kProbeReadCompleted : kProbePublished);
+    bool reported = online && transport.report(completedRead ? kProbeReadCompleted : kProbePublished);
+    for (UInt32 phase = kProbeGptScheme; reported && phase <= kProbeApfsBsdName; ++phase) {
+      if (topology & (1U << phase)) {
+        reported = transport.report(phase);
+      }
+    }
     if (!reported) {
       clearTransport();
     }
@@ -262,10 +305,13 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
     return 52;
   }
 
+  UInt32 reportedTopology = 0;
   for (unsigned elapsed = 0; elapsed < probeSeconds; elapsed += probeIntervalSeconds) {
-    if (!device->reportProbeProgress(*transport)) {
+    const UInt32 topology = storageTopology(device);
+    if (!device->reportProbeProgress(*transport, topology & ~reportedTopology)) {
       break;
     }
+    reportedTopology |= topology;
     IOSleep(probeIntervalSeconds * 1000);
   }
   device->quiesce();
