@@ -35,8 +35,11 @@ enum ProbePhase : UInt32 {
   kProbePartitionBsdName,
   kProbeApfsPersonality,
   kProbeApfsClassRegistered,
+  kProbeHighBlockRequest = 28,
+  kProbeInvalidBlockRequest,
+  kProbeNonReadRequest,
+  kProbeBlockIoFailed,
 };
-constexpr UInt32 lastApfsTracePhase = 23;
 
 bool hasApfsPartitionPersonality(IOService *partition)
 {
@@ -135,6 +138,12 @@ class Nx721jUsbBlock : public IOBlockStorageDevice {
   bool online = false;
   bool mediaChanged = false;
   bool completedRead = false;
+  UInt32 requestTrace = 0;
+
+  void traceRequest(ProbePhase phase)
+  {
+    __atomic_fetch_or(&requestTrace, 1U << phase, __ATOMIC_RELAXED);
+  }
 
   // The caller holds gate and can retire the context after releasing it.
   void clearTransport()
@@ -186,7 +195,7 @@ public:
   {
     IOLockLock(gate);
     bool reported = online && transport.report(completedRead ? kProbeReadCompleted : kProbePublished);
-    for (UInt32 phase = kProbeGptScheme; reported && phase <= lastApfsTracePhase; ++phase) {
+    for (UInt32 phase = kProbeGptScheme; reported && phase <= kProbeBlockIoFailed; ++phase) {
       if (topology & (1U << phase)) {
         reported = transport.report(phase);
       }
@@ -196,6 +205,11 @@ public:
     }
     IOLockUnlock(gate);
     return reported;
+  }
+
+  UInt32 blockRequestTrace() const
+  {
+    return __atomic_load_n(&requestTrace, __ATOMIC_RELAXED);
   }
 
   bool observedRead()
@@ -266,12 +280,18 @@ public:
   IOReturn doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                            IOStorageAttributes *, IOStorageCompletion *completion) override
   {
+    // The host's GPT experiment places the APFS container at logical block 256.
+    if (block >= 256 || count > 256 - block) {
+      traceRequest(kProbeHighBlockRequest);
+    }
     if (!buffer || !completion || !completion->action || !count ||
         block >= capacity || count > capacity - block ||
         buffer->getLength() < count * blockBytes) {
+      traceRequest(kProbeInvalidBlockRequest);
       return kIOReturnBadArgument;
     }
     if (buffer->getDirection() != kIODirectionIn) {
+      traceRequest(kProbeNonReadRequest);
       return kIOReturnNotWritable;
     }
 
@@ -295,7 +315,11 @@ public:
         }
       }
     }
-    completedRead |= result == kIOReturnSuccess;
+    if (result == kIOReturnSuccess) {
+      completedRead = true;
+    } else {
+      traceRequest(kProbeBlockIoFailed);
+    }
     IOLockUnlock(gate);
     completion->action(completion->target, completion->parameter, result, done);
     return kIOReturnSuccess;
@@ -373,7 +397,7 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
 
   UInt32 reportedTopology = 0;
   for (unsigned elapsed = 0; elapsed < probeSeconds; elapsed += probeIntervalSeconds) {
-    const UInt32 topology = storageTopology(device);
+    const UInt32 topology = storageTopology(device) | device->blockRequestTrace();
     if (!device->reportProbeProgress(*transport, topology & ~reportedTopology)) {
       break;
     }

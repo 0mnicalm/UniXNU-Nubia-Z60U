@@ -1,7 +1,7 @@
 --- a/iokit/Kernel/IOService.cpp
 +++ b/iokit/Kernel/IOService.cpp
-@@ -3822,4 +3822,44 @@
- TUNABLE(bool, iokit_print_verbose_match_logs, "iokit_print_verbose_match_logs", false);
+@@ -3498,4 +3498,44 @@
+ }
  
 +// Diagnostics for the NX721J USB experiment. Leave normal matching decisions alone.
 +static uint32_t nx721j_apfs_matching_stages;
@@ -43,22 +43,44 @@
 +	}
 +}
 +
- /*
-  * Alloc and probe matching classes,
-@@ -3904,4 +3936,6 @@
+ bool
+ IOService::open(   IOService *     forClient,
+@@ -3507,4 +3547,9 @@
+ 	ServiceOpenMessageContext   context;
+ 
++	const bool traceApfs = forClient && nx721j_trace_apfs(this,
++	    OSDynamicCast(OSString, forClient->getProperty(gIOClassKey)));
++	nx721j_apfs_stage(traceApfs, 24);
++	nx721j_apfs_stage(traceApfs && (reinterpret_cast<uintptr_t>(arg) & 2U), 27);
++
+ 	context.service             = this;
+ 	context.type                = kIOMessageServiceIsAttemptingOpen;
+@@ -3516,4 +3561,5 @@
+ 
+ 	if (false == lockForArbitration(false)) {
++		nx721j_apfs_stage(traceApfs, 26);
+ 		return false;
+ 	}
+@@ -3538,4 +3584,5 @@
+ 	unlockForArbitration();
+ 
++	nx721j_apfs_stage(traceApfs, ok ? 25 : 26);
+ 	return ok;
+ }
+@@ -3904,4 +3951,6 @@
  		bool existingIsBoot = false;
  		bool isReplacementCandidate = false;
 +		const bool traceApfs = nx721j_trace_apfs(this, OSDynamicCast(OSString, match->getObject(gIOClassKey)));
 +		nx721j_apfs_stage(traceApfs, 13);
  
  		do {
-@@ -3934,4 +3968,5 @@
+@@ -3934,4 +3983,5 @@
  				isReplacementCandidate = existingIsBoot && !newIsBoot;
  				if (!isDext && !isReplacementCandidate) {
 +					nx721j_apfs_stage(traceApfs, 14);
  					break;
  				}
-@@ -3947,6 +3982,8 @@
+@@ -3947,6 +3997,8 @@
  			// check the nub matches
  			if (false == matchPassive(props, kIOServiceChangesOK | kIOServiceClassDone)) {
 +				nx721j_apfs_stage(traceApfs, 15);
@@ -67,13 +89,13 @@
 +			nx721j_apfs_stage(traceApfs, 16);
  			if (isReplacementCandidate) {
  				if (canTerminateForReplacement(client)) {
-@@ -3977,4 +4014,5 @@
+@@ -3977,4 +4029,5 @@
  			needReloc = (false == gIOCatalogue->isModuleLoaded( match, &kextRef ));
  			if (needReloc) {
 +				nx721j_apfs_stage(traceApfs, 17);
  #if IOMATCHDEBUG
  				if (debugFlags & kIOLogCatalogue) {
-@@ -4083,5 +4121,8 @@
+@@ -4083,5 +4136,8 @@
  				}
  #endif
 +				const bool traceApfs = nx721j_trace_apfs(this, symbol);
@@ -82,7 +104,7 @@
 +				nx721j_apfs_stage(traceApfs, newInst ? 20 : 19);
  				inst->detach( this );
  				if (NULL == newInst) {
-@@ -4928,5 +4969,8 @@
+@@ -4928,5 +4984,8 @@
  	}
  
 +	const bool traceApfs = nx721j_trace_apfs(this, OSDynamicCast(OSString, service->getProperty(gIOClassKey)));
