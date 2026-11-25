@@ -13,6 +13,8 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 
+extern "C" uint32_t nx721j_apfs_match_trace();
+
 namespace {
 constexpr UInt64 blockBytes = 4096;
 constexpr UInt32 maxBlocksPerRead = 16;
@@ -34,6 +36,7 @@ enum ProbePhase : UInt32 {
   kProbeApfsPersonality,
   kProbeApfsClassRegistered,
 };
+constexpr UInt32 lastApfsTracePhase = 23;
 
 bool hasApfsPartitionPersonality(IOService *partition)
 {
@@ -117,7 +120,7 @@ UInt32 storageTopology(IOService *device)
   }
   const UInt32 topology = entries->isValid() ? seen : 0;
   entries->release();
-  return topology;
+  return topology | nx721j_apfs_match_trace();
 }
 }
 
@@ -183,7 +186,7 @@ public:
   {
     IOLockLock(gate);
     bool reported = online && transport.report(completedRead ? kProbeReadCompleted : kProbePublished);
-    for (UInt32 phase = kProbeGptScheme; reported && phase <= kProbeApfsClassRegistered; ++phase) {
+    for (UInt32 phase = kProbeGptScheme; reported && phase <= lastApfsTracePhase; ++phase) {
       if (topology & (1U << phase)) {
         reported = transport.report(phase);
       }

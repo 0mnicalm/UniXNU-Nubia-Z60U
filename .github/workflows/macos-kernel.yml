@@ -107,7 +107,9 @@ jobs:
       - name: Fetch the USB block storage headers
         if: ${{ inputs.usb_block || github.ref == 'refs/heads/codex/nx721j-usb-block' }}
         working-directory: unixnu
-        run: ./unixnu fetch IOStorageFamily -D "$GITHUB_WORKSPACE"
+        run: |
+          ./unixnu fetch IOStorageFamily -D "$GITHUB_WORKSPACE"
+          cp "$GITHUB_WORKSPACE/scripts/nx721j-apfs-match-trace.patch" patches/xnu/
 
       - name: Build kernel
         working-directory: unixnu
