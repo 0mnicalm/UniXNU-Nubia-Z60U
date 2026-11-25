@@ -316,8 +316,9 @@ jobs:
             llvm-nm --defined-only --just-symbol-name "$kernel" | awk '
               $0 == "__ZN9NativeUfs5startEP9IOService" { start=1 }
               $0 == "__ZL16nx721jUfsReadOnev" { probe=1 }
+              $0 == "_nx721j_usb_run_registration_probe" { storage=1 }
               END {
-                if (!start || !probe) {
+                if (!start || !probe || !storage) {
                   print "Missing NX721J runtime probe hook or probe body" > "/dev/stderr"
                   exit 1
                 }

@@ -21,6 +21,17 @@ class Nx721jUsbBlock : public IOBlockStorageDevice {
   void *context = nullptr;
   UInt64 capacity = 0;
   bool online = false;
+  bool mediaChanged = false;
+  bool completedRead = false;
+
+  // The caller holds gate and can retire the context after releasing it.
+  void clearTransport()
+  {
+    mediaChanged |= online;
+    online = false;
+    readBlocks = nullptr;
+    context = nullptr;
+  }
 
 public:
   bool configure(UInt64 blocks, Nx721jUsbReadBlocks *reader, void *readerContext)
@@ -41,7 +52,7 @@ public:
 
   bool start(IOService *provider) override
   {
-    if (!IOBlockStorageDevice::start(provider)) {
+    if (!gate || !readBlocks || !IOBlockStorageDevice::start(provider)) {
       return false;
     }
     IOLockLock(gate);
@@ -51,12 +62,25 @@ public:
     return true;
   }
 
-  void stop(IOService *provider) override
+  void quiesce()
   {
     // Wait for the serialized transport call before retiring its context.
     IOLockLock(gate);
-    online = false;
+    clearTransport();
     IOLockUnlock(gate);
+  }
+
+  bool observedRead()
+  {
+    IOLockLock(gate);
+    const bool observed = completedRead;
+    IOLockUnlock(gate);
+    return observed;
+  }
+
+  void stop(IOService *provider) override
+  {
+    quiesce();
     IOBlockStorageDevice::stop(provider);
   }
 
@@ -91,7 +115,8 @@ public:
     IOLockLock(gate);
     *present = online;
     if (changed) {
-      *changed = false;
+      *changed = mediaChanged;
+      mediaChanged = false;
     }
     IOLockUnlock(gate);
     return kIOReturnSuccess;
@@ -131,6 +156,9 @@ public:
       const UInt32 burst = static_cast<UInt32>(remaining < maxBlocksPerRead ? remaining : maxBlocksPerRead);
       const IOByteCount length = burst * blockBytes;
       result = readBlocks(context, block + completedBlocks, burst, staging);
+      if (result == kIOReturnNoDevice) {
+        clearTransport();
+      }
       if (result == kIOReturnSuccess) {
         const IOByteCount copied = buffer->writeBytes(done, staging, length);
         done += copied;
@@ -139,6 +167,7 @@ public:
         }
       }
     }
+    completedRead |= result == kIOReturnSuccess;
     IOLockUnlock(gate);
     completion->action(completion->target, completion->parameter, result, done);
     return kIOReturnSuccess;
@@ -169,14 +198,23 @@ IOService *nx721j_usb_publish_block(IOService *provider, UInt64 blocks,
   return device;
 }
 
+void nx721j_usb_quiesce_block(IOService *device)
+{
+  if (auto *block = OSDynamicCast(Nx721jUsbBlock, device)) {
+    block->quiesce();
+  }
+}
 
 static IOReturn readUsbBlocks(void *context, UInt64 block, UInt32 count, void *destination)
 {
   auto *transport = static_cast<Nx721jUsbBlockTransport *>(context);
   if (!transport->online) {
-    return kIOReturnNotReady;
+    return kIOReturnNoDevice;
   }
-  return transport->read(block, count, destination) ? kIOReturnSuccess : kIOReturnIOError;
+  if (transport->read(block, count, destination)) {
+    return kIOReturnSuccess;
+  }
+  return transport->online ? kIOReturnIOError : kIOReturnNoDevice;
 }
 
 IOService *nx721j_usb_publish_transport(IOService *provider, Nx721jUsbBlockTransport *transport)
@@ -189,4 +227,34 @@ IOService *nx721j_usb_publish_transport(IOService *provider, Nx721jUsbBlockTrans
     transport->online = false;
   }
   return device;
+}
+
+unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
+{
+  const auto *storage = static_cast<const OSMetaClass *>(&IOBlockStorageDevice::gMetaClass);
+  const auto *block = static_cast<const OSMetaClass *>(&Nx721jUsbBlock::gMetaClass);
+  if (storage->getClassSize() != sizeof(IOBlockStorageDevice) ||
+      block->getClassSize() != sizeof(Nx721jUsbBlock)) {
+    return 51;
+  }
+  auto *device = static_cast<Nx721jUsbBlock *>(
+      nx721j_usb_publish_transport(IOService::getServiceRoot(), transport));
+  if (!device) {
+    return 52;
+  }
+
+  // Give IOKit matching time to probe media while the endpoint owner is still alive.
+  IOSleep(5000);
+  device->quiesce();
+  const bool read = device->observedRead();
+  const bool closed = transport->close();
+  const bool terminationRequested = device->terminate();
+  device->release();
+  if (!terminationRequested) {
+    return 53;
+  }
+  if (!read) {
+    return 54;
+  }
+  return closed ? 0 : 55;
 }
