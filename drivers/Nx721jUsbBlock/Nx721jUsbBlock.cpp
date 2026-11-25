@@ -38,10 +38,12 @@ UInt32 storageTopology(IOService *device)
       seen |= 1U << kProbeGptScheme;
     }
     if (entry->metaCast("IOMedia")) {
-      auto hint = entry->copyProperty("Content Hint");
-      auto *type = OSDynamicCast(OSString, hint.get());
-      if (type && type->isEqualTo("7C3457EF-0000-11AA-AA11-00306543ECAC")) {
-        seen |= 1U << kProbeApfsPartition;
+      if (auto *hint = entry->copyProperty("Content Hint")) {
+        auto *type = OSDynamicCast(OSString, hint);
+        if (type && type->isEqualTo("7C3457EF-0000-11AA-AA11-00306543ECAC")) {
+          seen |= 1U << kProbeApfsPartition;
+        }
+        hint->release();
       }
     }
     if (entry->metaCast("AppleAPFSContainerScheme") || entry->metaCast("AppleAPFSContainer")) {
@@ -49,12 +51,15 @@ UInt32 storageTopology(IOService *device)
     }
     if (entry->metaCast("AppleAPFSVolume")) {
       seen |= 1U << kProbeApfsVolume;
-      if (entry->copyProperty("BSD Name")) {
+      if (auto *name = entry->copyProperty("BSD Name")) {
         seen |= 1U << kProbeApfsBsdName;
+        name->release();
       }
     }
   }
-  return entries->isValid() ? seen : 0;
+  const UInt32 topology = entries->isValid() ? seen : 0;
+  entries->release();
+  return topology;
 }
 }
 
