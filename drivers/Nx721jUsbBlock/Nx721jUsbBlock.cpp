@@ -12,6 +12,7 @@
 #include <libkern/c++/OSOrderedSet.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
+#include <sys/vnode.h>
 
 extern "C" uint32_t nx721j_apfs_match_trace();
 
@@ -22,6 +23,7 @@ constexpr IOByteCount stagingBytes = blockBytes * maxBlocksPerRead;
 constexpr unsigned probeSeconds = 45;
 constexpr unsigned probeIntervalSeconds = 5;
 constexpr char apfsContentHint[] = "7C3457EF-0000-11AA-AA11-00306543ECAC";
+constexpr const char *testMountPoints[] = {"/mnt", "/Volumes"};
 enum ProbePhase : UInt32 {
   kProbePublished = 1,
   kProbeReadCompleted,
@@ -39,6 +41,8 @@ enum ProbePhase : UInt32 {
   kProbeInvalidBlockRequest,
   kProbeNonReadRequest,
   kProbeBlockIoFailed,
+  kProbeApfsDevfsBlock,
+  kProbeApfsMountPoint,
 };
 
 bool hasApfsPartitionPersonality(IOService *partition)
@@ -75,9 +79,10 @@ bool hasApfsPartitionPersonality(IOService *partition)
   return found;
 }
 
-UInt32 storageTopology(IOService *device)
+UInt64 storageTopology(IOService *device)
 {
-  UInt32 seen = 0;
+  UInt64 seen = 0;
+  char devicePath[64] = {};
   auto entries = IORegistryIterator::iterateOver(device, gIOServicePlane, kIORegistryIterateRecursively);
   if (!entries) {
     return seen;
@@ -117,13 +122,44 @@ UInt32 storageTopology(IOService *device)
       seen |= 1U << kProbeApfsVolume;
       if (auto *name = entry->copyProperty("BSD Name")) {
         seen |= 1U << kProbeApfsBsdName;
+        auto *bsd = OSDynamicCast(OSString, name);
+        if (!devicePath[0] && bsd && bsd->getLength() &&
+            bsd->getLength() <= sizeof(devicePath) - sizeof("/dev/")) {
+          snprintf(devicePath, sizeof(devicePath), "/dev/%s", bsd->getCStringNoCopy());
+        }
         name->release();
       }
     }
   }
-  const UInt32 topology = entries->isValid() ? seen : 0;
+  const bool valid = entries->isValid();
   entries->release();
-  return topology | nx721j_apfs_match_trace();
+  if (!valid) {
+    return nx721j_apfs_match_trace();
+  }
+
+  // Do not hold the USB I/O lock across VFS operations.
+  if (devicePath[0]) {
+    auto ctx = vfs_context_current();
+    vnode_t vnode = nullptr;
+    if (vnode_lookup(devicePath, 0, &vnode, ctx) == 0) {
+      if (vnode_vtype(vnode) == VBLK) {
+        seen |= 1ULL << kProbeApfsDevfsBlock;
+      }
+      vnode_put(vnode);
+    }
+    for (const char *path : testMountPoints) {
+      constexpr int flags = VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT;
+      if (vnode_lookup(path, flags, &vnode, ctx) == 0) {
+        const bool available = vnode_vtype(vnode) == VDIR && !vnode_mountedhere(vnode);
+        vnode_put(vnode);
+        if (available) {
+          seen |= 1ULL << kProbeApfsMountPoint;
+          break;
+        }
+      }
+    }
+  }
+  return seen | nx721j_apfs_match_trace();
 }
 }
 
@@ -191,12 +227,12 @@ public:
     IOLockUnlock(gate);
   }
 
-  bool reportProbeProgress(Nx721jUsbBlockTransport &transport, UInt32 topology)
+  bool reportProbeProgress(Nx721jUsbBlockTransport &transport, UInt64 topology)
   {
     IOLockLock(gate);
     bool reported = online && transport.report(completedRead ? kProbeReadCompleted : kProbePublished);
-    for (UInt32 phase = kProbeGptScheme; reported && phase <= kProbeBlockIoFailed; ++phase) {
-      if (topology & (1U << phase)) {
+    for (UInt32 phase = kProbeGptScheme; reported && phase <= kProbeApfsMountPoint; ++phase) {
+      if (topology & (1ULL << phase)) {
         reported = transport.report(phase);
       }
     }
@@ -396,9 +432,9 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
     return 52;
   }
 
-  UInt32 reportedTopology = 0;
+  UInt64 reportedTopology = 0;
   for (unsigned elapsed = 0; elapsed < probeSeconds; elapsed += probeIntervalSeconds) {
-    const UInt32 topology = storageTopology(device) | device->blockRequestTrace();
+    const UInt64 topology = storageTopology(device) | device->blockRequestTrace();
     if (!device->reportProbeProgress(*transport, topology & ~reportedTopology)) {
       break;
     }
