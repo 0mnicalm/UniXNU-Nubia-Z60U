@@ -18,6 +18,7 @@ struct Nx721jUsbBlockTransport {
 
   bool open();
   bool close();
+  bool report(uint32_t phase);
   bool read(uint64_t firstBlock, uint32_t blockCount, void *destination);
 
 private:
@@ -82,6 +83,11 @@ inline bool Nx721jUsbBlockTransport::close()
   const bool acknowledged = online && exchange(2, 0, 0, nullptr);
   online = false;
   return acknowledged;
+}
+
+inline bool Nx721jUsbBlockTransport::report(uint32_t phase)
+{
+  return online && exchange(3, phase, 0, nullptr);
 }
 
 inline bool Nx721jUsbBlockTransport::read(uint64_t index, uint32_t count, void *destination)

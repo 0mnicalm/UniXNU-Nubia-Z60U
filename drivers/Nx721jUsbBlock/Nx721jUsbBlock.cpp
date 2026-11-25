@@ -10,6 +10,14 @@ namespace {
 constexpr UInt64 blockBytes = 4096;
 constexpr UInt32 maxBlocksPerRead = 16;
 constexpr IOByteCount stagingBytes = blockBytes * maxBlocksPerRead;
+constexpr unsigned probeSeconds = 45;
+constexpr unsigned probeIntervalSeconds = 5;
+enum ProbePhase : UInt32 {
+  kProbePublished = 1,
+  kProbeReadCompleted,
+  kProbeDetached,
+  kProbeDetachPending,
+};
 }
 
 class Nx721jUsbBlock : public IOBlockStorageDevice {
@@ -68,6 +76,17 @@ public:
     IOLockLock(gate);
     clearTransport();
     IOLockUnlock(gate);
+  }
+
+  bool reportProbeProgress(Nx721jUsbBlockTransport &transport)
+  {
+    IOLockLock(gate);
+    const bool reported = online && transport.report(completedRead ? kProbeReadCompleted : kProbePublished);
+    if (!reported) {
+      clearTransport();
+    }
+    IOLockUnlock(gate);
+    return reported;
   }
 
   bool observedRead()
@@ -243,14 +262,25 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
     return 52;
   }
 
-  // Give IOKit matching time to probe media while the endpoint owner is still alive.
-  IOSleep(5000);
+  for (unsigned elapsed = 0; elapsed < probeSeconds; elapsed += probeIntervalSeconds) {
+    if (!device->reportProbeProgress(*transport)) {
+      break;
+    }
+    IOSleep(probeIntervalSeconds * 1000);
+  }
   device->quiesce();
   const bool read = device->observedRead();
-  const bool closed = transport->close();
   const bool terminationRequested = device->terminate();
+  if (terminationRequested) {
+    for (unsigned attempt = 0; attempt < 30 && device->getProvider(); ++attempt) {
+      IOSleep(100);
+    }
+  }
+  const bool detached = device->getProvider() == nullptr;
+  transport->report(detached ? kProbeDetached : kProbeDetachPending);
+  const bool closed = transport->close();
   device->release();
-  if (!terminationRequested) {
+  if (!detached) {
     return 53;
   }
   if (!read) {
