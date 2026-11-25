@@ -247,7 +247,8 @@ public:
   IOReturn reportBlockSize(UInt64 *value) override { *value = blockBytes; return kIOReturnSuccess; }
   IOReturn reportMaxValidBlock(UInt64 *value) override { *value = capacity - 1; return kIOReturnSuccess; }
   IOReturn reportEjectability(bool *value) override { *value = false; return kIOReturnSuccess; }
-  IOReturn reportRemovability(bool *value) override { *value = true; return kIOReturnSuccess; }
+  // The backing image is fixed for this device's lifetime. USB removal detaches the device itself.
+  IOReturn reportRemovability(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportWriteProtection(bool *value) override { *value = true; return kIOReturnSuccess; }
   IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
