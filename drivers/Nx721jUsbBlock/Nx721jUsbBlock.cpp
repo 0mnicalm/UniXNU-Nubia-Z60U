@@ -2,11 +2,16 @@
 #include "Nx721jUsbBlock.h"
 #include "Nx721jUsbBlockTransport.h"
 
+#include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IORegistryEntry.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSOrderedSet.h>
 #include <libkern/c++/OSString.h>
+#include <libkern/c++/OSSymbol.h>
 
 namespace {
 constexpr UInt64 blockBytes = 4096;
@@ -14,6 +19,7 @@ constexpr UInt32 maxBlocksPerRead = 16;
 constexpr IOByteCount stagingBytes = blockBytes * maxBlocksPerRead;
 constexpr unsigned probeSeconds = 45;
 constexpr unsigned probeIntervalSeconds = 5;
+constexpr char apfsContentHint[] = "7C3457EF-0000-11AA-AA11-00306543ECAC";
 enum ProbePhase : UInt32 {
   kProbePublished = 1,
   kProbeReadCompleted,
@@ -24,7 +30,44 @@ enum ProbePhase : UInt32 {
   kProbeApfsContainer,
   kProbeApfsVolume,
   kProbeApfsBsdName,
+  kProbePartitionBsdName,
+  kProbeApfsPersonality,
+  kProbeApfsClassRegistered,
 };
+
+bool hasApfsPartitionPersonality(IOService *partition)
+{
+  if (!gIOCatalogue) {
+    return false;
+  }
+  SInt32 generation = 0;
+  auto *drivers = gIOCatalogue->findDrivers(partition, &generation);
+  if (!drivers) {
+    return false;
+  }
+  bool found = false;
+  for (unsigned i = 0; !found && i < drivers->getCount(); ++i) {
+    auto *personality = OSDynamicCast(OSDictionary, drivers->getObject(i));
+    if (!personality) {
+      continue;
+    }
+    auto *name = OSDynamicCast(OSString, personality->getObject("IOClass"));
+    auto *properties = OSDynamicCast(OSArray, personality->getObject("IOPropertyMatch"));
+    if (!name || !name->isEqualTo("AppleAPFSContainerScheme") || !properties) {
+      continue;
+    }
+    for (unsigned j = 0; j < properties->getCount(); ++j) {
+      auto *match = OSDynamicCast(OSDictionary, properties->getObject(j));
+      auto *hint = match ? OSDynamicCast(OSString, match->getObject("Content Hint")) : nullptr;
+      if (hint && hint->isEqualTo(apfsContentHint)) {
+        found = true;
+        break;
+      }
+    }
+  }
+  drivers->release();
+  return found;
+}
 
 UInt32 storageTopology(IOService *device)
 {
@@ -40,8 +83,23 @@ UInt32 storageTopology(IOService *device)
     if (entry->metaCast("IOMedia")) {
       if (auto *hint = entry->copyProperty("Content Hint")) {
         auto *type = OSDynamicCast(OSString, hint);
-        if (type && type->isEqualTo("7C3457EF-0000-11AA-AA11-00306543ECAC")) {
+        if (type && type->isEqualTo(apfsContentHint)) {
           seen |= 1U << kProbeApfsPartition;
+          if (auto *name = entry->copyProperty("BSD Name")) {
+            seen |= 1U << kProbePartitionBsdName;
+            name->release();
+          }
+          if (auto *partition = OSDynamicCast(IOService, entry)) {
+            if (hasApfsPartitionPersonality(partition)) {
+              seen |= 1U << kProbeApfsPersonality;
+            }
+          }
+          if (auto *name = OSSymbol::withCString("AppleAPFSContainerScheme")) {
+            if (OSMetaClass::getMetaClassWithName(name)) {
+              seen |= 1U << kProbeApfsClassRegistered;
+            }
+            name->release();
+          }
         }
         hint->release();
       }
@@ -125,7 +183,7 @@ public:
   {
     IOLockLock(gate);
     bool reported = online && transport.report(completedRead ? kProbeReadCompleted : kProbePublished);
-    for (UInt32 phase = kProbeGptScheme; reported && phase <= kProbeApfsBsdName; ++phase) {
+    for (UInt32 phase = kProbeGptScheme; reported && phase <= kProbeApfsClassRegistered; ++phase) {
       if (topology & (1U << phase)) {
         reported = transport.report(phase);
       }
