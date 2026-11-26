@@ -15,7 +15,8 @@
 #include <sys/vnode.h>
 
 extern "C" uint32_t nx721j_apfs_match_trace();
-extern "C" int nx721j_usb_apfs_readonly_check(const char *devicePath, int *readError, int *unmountError);
+extern "C" int nx721j_usb_apfs_readonly_check(const char *devicePath, int *mountStep,
+                                             int *readError, int *unmountError);
 
 namespace {
 constexpr UInt64 blockBytes = 4096;
@@ -51,6 +52,7 @@ enum MountStage : UInt32 {
   kMountVolume = 1,
   kMountReadFile,
   kMountUnmount,
+  kMountFailureStep,
 };
 
 bool hasApfsPartitionPersonality(IOService *partition)
@@ -258,9 +260,9 @@ public:
     return reported;
   }
 
-  bool reportMountResult(Nx721jUsbBlockTransport &transport, MountStage stage, int error)
+  bool reportMountResult(Nx721jUsbBlockTransport &transport, MountStage stage, int value)
   {
-    return reportMountStatus(transport, mountStatusTag | (stage << 8) | (static_cast<UInt32>(error) & 0xff));
+    return reportMountStatus(transport, mountStatusTag | (stage << 8) | (static_cast<UInt32>(value) & 0xff));
   }
 
   UInt32 blockRequestTrace() const
@@ -469,8 +471,10 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
         break;
       }
       mountAttempted = true;
-      mountError = nx721j_usb_apfs_readonly_check(devicePath, &readError, &unmountError);
+      int mountStep = 0;
+      mountError = nx721j_usb_apfs_readonly_check(devicePath, &mountStep, &readError, &unmountError);
       if (!device->reportMountResult(*transport, kMountVolume, mountError) ||
+          (mountError && !device->reportMountResult(*transport, kMountFailureStep, mountStep)) ||
           (!mountError &&
            (!device->reportMountResult(*transport, kMountReadFile, readError) ||
             !device->reportMountResult(*transport, kMountUnmount, unmountError)))) {
