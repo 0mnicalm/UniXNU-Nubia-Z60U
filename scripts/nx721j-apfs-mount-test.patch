@@ -1,14 +1,15 @@
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
-@@ -82,6 +82,7 @@
+@@ -82,6 +82,8 @@
  #include <sys/mount_internal.h>
  #include <sys/proc_internal.h>
  #include <sys/kauth.h>
 +#include <libkern/crypto/sha2.h>
++#include <sys/msgbuf.h>
  #include <sys/uio_internal.h>
  #include <kern/kalloc.h>
  #include <sys/mman.h>
-@@ -194,9 +195,30 @@
+@@ -194,9 +196,70 @@
      user_addr_t bufp, int *sizep, boolean_t is_64_bit,
      boolean_t partial_copy);
  static int fsync_common(proc_t p, struct fsync_args *uap, int flags);
@@ -30,7 +31,47 @@
 +	enum nx721j_mount_step step;
 +	const char *device_path;
 +	mount_t mount;
++	char *log;
++	int log_capacity;
++	int log_length;
 +};
++
++extern void bsd_log_lock_safe(void);
++extern void bsd_log_unlock(void);
++
++static int
++nx721j_mount_log_position(int start, struct nx721j_apfs_mount *probe)
++{
++	int position = -1;
++	bsd_log_lock_safe();
++	const struct msgbuf *log = msgbufp;
++	if (log && log->msg_magic == MSG_MAGIC && log->msg_bufc &&
++	    log->msg_bufx >= 0 && log->msg_bufx < log->msg_size) {
++		position = log->msg_bufx;
++		if (start >= 0 && start < log->msg_size) {
++			int length = position - start;
++			if (length < 0) {
++				length += log->msg_size;
++			}
++			if (length > probe->log_capacity) {
++				length = probe->log_capacity;
++				start = position - length;
++				if (start < 0) {
++					start += log->msg_size;
++				}
++			}
++			for (int i = 0; i < length; ++i) {
++				probe->log[i] = log->msg_bufc[start];
++				if (++start == log->msg_size) {
++					start = 0;
++				}
++			}
++			probe->log_length = length;
++		}
++	}
++	bsd_log_unlock();
++	return position;
++}
 +
  static int mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
      struct componentname *cnp, user_addr_t fsmountargs,
@@ -40,7 +81,7 @@
  void vfs_notify_mount(vnode_t pdvp);
  
  int prepare_coveredvp(vnode_t vp, vfs_context_t ctx, struct componentname *cnp, const char *fsname, uint32_t internal_flags);
-@@ -328,7 +350,7 @@
+@@ -328,7 +391,7 @@
  
  	kern_flags |= KERNEL_MOUNT_KMOUNT;
  	error = mount_common(fstype, pvp, vp, &nd.ni_cnd, CAST_USER_ADDR_T(data),
@@ -49,7 +90,7 @@
  
  	if (did_namei) {
  		vnode_put(vp);
-@@ -459,7 +481,7 @@
+@@ -459,7 +522,7 @@
  		return error;
  	}
  
@@ -58,7 +99,7 @@
  
  	zfree(ZV_NAMEI, cn.cn_pnbuf);
  	vnode_put(pvp);
-@@ -953,7 +975,7 @@
+@@ -953,7 +1016,7 @@
  	}
  
  	error = mount_common(fstypename, pvp, vp, &nd.ni_cnd, uap->data, flags, 0,
@@ -67,7 +108,7 @@
  
  out:
  
-@@ -991,7 +1013,7 @@
+@@ -991,7 +1054,7 @@
  static int
  mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
      struct componentname *cnp, user_addr_t fsmountargs, int flags, uint32_t internal_flags,
@@ -76,7 +117,7 @@
  {
  #if !CONFIG_MACF
  #pragma unused(labelstr)
-@@ -1165,6 +1187,14 @@
+@@ -1165,6 +1228,14 @@
  		goto out1;
  	}
  
@@ -91,7 +132,7 @@
  	error = prepare_coveredvp(vp, ctx, cnp, fstypename, internal_flags);
  	if (error != 0) {
  		goto out1;
-@@ -1316,6 +1346,10 @@
+@@ -1316,6 +1387,10 @@
  		}
  #endif // CONFIG_BASESYSTEMROOT
  
@@ -102,7 +143,7 @@
  		if (do_copyin_devpath) {
  			if (vfs_context_is64bit(ctx)) {
  				if ((error = copyin(fsmountargs, (caddr_t)&devpath, sizeof(devpath)))) {
-@@ -1337,14 +1371,17 @@
+@@ -1337,14 +1412,17 @@
  		if ((devpath)) {
  			struct nameidata nd;
  
@@ -122,7 +163,7 @@
  			if ((error = namei(&nd))) {
  				goto out1;
  			}
-@@ -1388,14 +1425,23 @@
+@@ -1388,14 +1466,23 @@
  			 * (except for root, which might share swap device for miniroot).
  			 * Flush out any old buffers remaining from a previous use.
  			 */
@@ -146,7 +187,7 @@
  			}
  			if ((error = VNOP_FSYNC(devvp, MNT_WAIT, ctx))) {
  				error = ENOTBLK;
-@@ -1414,6 +1460,9 @@
+@@ -1414,6 +1501,9 @@
  				goto out3;
  			}
  #endif /* MAC */
@@ -156,17 +197,23 @@
  			if ((error = VNOP_OPEN(devvp, ronly ? FREAD : FREAD | FWRITE, ctx))) {
  				goto out3;
  			}
-@@ -1582,6 +1631,9 @@
+@@ -1582,7 +1672,15 @@
  		error = EINVAL;
  #endif
  	} else {
++		int log_start = -1;
 +		if (probe) {
 +			probe->step = NX721J_MOUNT_FILESYSTEM;
++			log_start = nx721j_mount_log_position(-1, probe);
 +		}
  		error = VFS_MOUNT(mp, device_vnode, fsmountargs, ctx);
++		if (probe && error != 0 && log_start >= 0) {
++			(void)nx721j_mount_log_position(log_start, probe);
++		}
  	}
  
-@@ -1623,6 +1675,9 @@
+ 	if (flags & MNT_UPDATE) {
+@@ -1623,6 +1721,9 @@
  		}
  
  #if CONFIG_MACF
@@ -176,7 +223,7 @@
  		error = mac_mount_check_mount_late(ctx, mp);
  		if (error != 0) {
  			goto out4;
-@@ -1646,6 +1701,9 @@
+@@ -1646,6 +1747,9 @@
  		}
  #endif  /* MAC */
  
@@ -186,7 +233,7 @@
  		vnode_lock_spin(vp);
  		CLR(vp->v_flag, VMOUNT);
  		vp->v_mountedhere = mp;
-@@ -1682,6 +1740,9 @@
+@@ -1682,6 +1786,9 @@
  		 */
  		(void)VFS_START(mp, 0, ctx);
  
@@ -196,7 +243,7 @@
  		if (mount_list_add(mp) != 0) {
  			/*
  			 * The system is shutting down trying to umount
-@@ -1689,6 +1750,10 @@
+@@ -1689,6 +1796,10 @@
  			 */
  			error = EBUSY;
  			goto out4;
@@ -207,7 +254,7 @@
  		}
  		lck_rw_done(&mp->mnt_rwlock);
  		is_rwlock_locked = FALSE;
-@@ -2607,6 +2672,111 @@
+@@ -2607,6 +2718,119 @@
  	vnode_put(vp);
  	/* safedounmount consumes the mount ref */
  	return safedounmount(mp, uap->flags, ctx);
@@ -271,14 +318,21 @@
 +	return memcmp(digest, expected, sizeof(digest)) == 0 ? 0 : EIO;
 +}
 +
-+int nx721j_usb_apfs_readonly_check(const char *device_path, int *mount_step, int *read_error, int *unmount_error);
++int nx721j_usb_apfs_readonly_check(const char *device_path, int *mount_step, int *read_error,
++    int *unmount_error, char *log, int *log_length);
 +
 +int
-+nx721j_usb_apfs_readonly_check(const char *device_path, int *mount_step, int *read_error, int *unmount_error)
++nx721j_usb_apfs_readonly_check(const char *device_path, int *mount_step, int *read_error,
++    int *unmount_error, char *log, int *log_length)
 +{
 +	struct nameidata nd;
 +	vfs_context_t ctx = vfs_context_current();
-+	struct nx721j_apfs_mount probe = { .device_path = device_path };
++	struct nx721j_apfs_mount probe = {
++		.device_path = device_path,
++		.log = log,
++		.log_capacity = *log_length,
++	};
++	*log_length = 0;
 +	*mount_step = NX721J_MOUNT_LOOKUP;
 +	const char prefix[] = "/dev/disk";
 +	if (strncmp(device_path, prefix, sizeof(prefix) - 1) != 0 ||
@@ -298,6 +352,7 @@
 +	if (probe.step) {
 +		*mount_step = probe.step;
 +	}
++	*log_length = probe.log_length;
 +	vnode_put(nd.ni_vp);
 +	vnode_put(nd.ni_dvp);
 +	nameidone(&nd);
@@ -319,7 +374,7 @@
  }
  
  int
-@@ -14511,7 +14681,7 @@
+@@ -14511,7 +14735,7 @@
  	smnt_data.sm_cnp = &snapndp->ni_cnd;
  	error = mount_common(mp->mnt_vfsstat.f_fstypename, pvp, vp,
  	    &dirndp->ni_cnd, CAST_USER_ADDR_T(&smnt_data), flags & (MNT_DONTBROWSE | MNT_IGNORE_OWNERSHIP),

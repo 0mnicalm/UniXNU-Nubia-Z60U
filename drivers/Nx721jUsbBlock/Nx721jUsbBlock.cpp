@@ -16,7 +16,8 @@
 
 extern "C" uint32_t nx721j_apfs_match_trace();
 extern "C" int nx721j_usb_apfs_readonly_check(const char *devicePath, int *mountStep,
-                                             int *readError, int *unmountError);
+                                             int *readError, int *unmountError,
+                                             char *log, int *logLength);
 
 namespace {
 constexpr UInt64 blockBytes = 4096;
@@ -26,7 +27,10 @@ constexpr unsigned probeSeconds = 45;
 constexpr unsigned probeIntervalSeconds = 5;
 constexpr char apfsContentHint[] = "7C3457EF-0000-11AA-AA11-00306543ECAC";
 constexpr UInt32 mountStatusTag = 0x4e580000;
+constexpr UInt32 mountLogTag = 0x4e590000;
+constexpr int mountLogCapacity = 240;
 constexpr UInt32 mountAttempt = 34;
+constexpr int mountCallbackStep = 8;
 enum ProbePhase : UInt32 {
   kProbePublished = 1,
   kProbeReadCompleted,
@@ -53,6 +57,7 @@ enum MountStage : UInt32 {
   kMountReadFile,
   kMountUnmount,
   kMountFailureStep,
+  kMountLogLength,
 };
 
 bool hasApfsPartitionPersonality(IOService *partition)
@@ -265,6 +270,22 @@ public:
     return reportMountStatus(transport, mountStatusTag | (stage << 8) | (static_cast<UInt32>(value) & 0xff));
   }
 
+  bool reportMountLog(Nx721jUsbBlockTransport &transport, const char *log, int length)
+  {
+    if (length < 0 || length > mountLogCapacity ||
+        !reportMountResult(transport, kMountLogLength, length)) {
+      return false;
+    }
+    for (int i = 0; i < length; i += 2) {
+      const UInt32 first = static_cast<UInt8>(log[i]);
+      const UInt32 second = i + 1 < length ? static_cast<UInt8>(log[i + 1]) : 0;
+      if (!reportMountStatus(transport, mountLogTag | (second << 8) | first)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   UInt32 blockRequestTrace() const
   {
     return __atomic_load_n(&requestTrace, __ATOMIC_RELAXED);
@@ -472,9 +493,14 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
       }
       mountAttempted = true;
       int mountStep = 0;
-      mountError = nx721j_usb_apfs_readonly_check(devicePath, &mountStep, &readError, &unmountError);
+      char mountLog[mountLogCapacity];
+      int mountLogLength = sizeof(mountLog);
+      mountError = nx721j_usb_apfs_readonly_check(devicePath, &mountStep, &readError, &unmountError,
+                                                mountLog, &mountLogLength);
       if (!device->reportMountResult(*transport, kMountVolume, mountError) ||
-          (mountError && !device->reportMountResult(*transport, kMountFailureStep, mountStep)) ||
+          (mountError &&
+           (!device->reportMountResult(*transport, kMountFailureStep, mountStep) ||
+            (mountStep == mountCallbackStep && !device->reportMountLog(*transport, mountLog, mountLogLength)))) ||
           (!mountError &&
            (!device->reportMountResult(*transport, kMountReadFile, readError) ||
             !device->reportMountResult(*transport, kMountUnmount, unmountError)))) {
