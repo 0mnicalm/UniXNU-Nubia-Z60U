@@ -1,0 +1,231 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -82,6 +82,7 @@
+ #include <sys/mount_internal.h>
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
++#include <libkern/crypto/sha2.h>
+ #include <sys/uio_internal.h>
+ #include <kern/kalloc.h>
+ #include <sys/mman.h>
+@@ -194,9 +195,15 @@
+     user_addr_t bufp, int *sizep, boolean_t is_64_bit,
+     boolean_t partial_copy);
+ static int fsync_common(proc_t p, struct fsync_args *uap, int flags);
++struct nx721j_apfs_mount {
++	const char *device_path;
++	mount_t mount;
++};
++
+ static int mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
+     struct componentname *cnp, user_addr_t fsmountargs,
+-    int flags, uint32_t internal_flags, char *labelstr, vfs_context_t ctx);
++    int flags, uint32_t internal_flags, char *labelstr, vfs_context_t ctx,
++    struct nx721j_apfs_mount *probe);
+ void vfs_notify_mount(vnode_t pdvp);
+ 
+ int prepare_coveredvp(vnode_t vp, vfs_context_t ctx, struct componentname *cnp, const char *fsname, uint32_t internal_flags);
+@@ -328,7 +335,7 @@
+ 
+ 	kern_flags |= KERNEL_MOUNT_KMOUNT;
+ 	error = mount_common(fstype, pvp, vp, &nd.ni_cnd, CAST_USER_ADDR_T(data),
+-	    syscall_flags, kern_flags, NULL, ctx);
++	    syscall_flags, kern_flags, NULL, ctx, NULL);
+ 
+ 	if (did_namei) {
+ 		vnode_put(vp);
+@@ -459,7 +466,7 @@
+ 		return error;
+ 	}
+ 
+-	error = mount_common(fstypename, pvp, vp, &cn, uap->data, flags, KERNEL_MOUNT_FMOUNT, labelstr, ctx);
++	error = mount_common(fstypename, pvp, vp, &cn, uap->data, flags, KERNEL_MOUNT_FMOUNT, labelstr, ctx, NULL);
+ 
+ 	zfree(ZV_NAMEI, cn.cn_pnbuf);
+ 	vnode_put(pvp);
+@@ -953,7 +960,7 @@
+ 	}
+ 
+ 	error = mount_common(fstypename, pvp, vp, &nd.ni_cnd, uap->data, flags, 0,
+-	    labelstr, ctx);
++	    labelstr, ctx, NULL);
+ 
+ out:
+ 
+@@ -991,7 +998,7 @@
+ static int
+ mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
+     struct componentname *cnp, user_addr_t fsmountargs, int flags, uint32_t internal_flags,
+-    char *labelstr, vfs_context_t ctx)
++    char *labelstr, vfs_context_t ctx, struct nx721j_apfs_mount *probe)
+ {
+ #if !CONFIG_MACF
+ #pragma unused(labelstr)
+@@ -1162,6 +1169,11 @@
+ 	    ((internal_flags & KERNEL_MOUNT_VOLBYROLE_MASK) == 0) &&
+ 	    ((internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) == 0)) {
+ 		error = EINVAL;  /* unsupported request */
++		goto out1;
++	}
++
++	if (probe && !(vfsp->vfc_vfsflags & VFC_VFSLOCALARGS)) {
++		error = ENOTSUP;
+ 		goto out1;
+ 	}
+ 
+@@ -1316,6 +1328,10 @@
+ 		}
+ #endif // CONFIG_BASESYSTEMROOT
+ 
++		if (probe) {
++			devpath = CAST_USER_ADDR_T(probe->device_path);
++			do_copyin_devpath = false;
++		}
+ 		if (do_copyin_devpath) {
+ 			if (vfs_context_is64bit(ctx)) {
+ 				if ((error = copyin(fsmountargs, (caddr_t)&devpath, sizeof(devpath)))) {
+@@ -1337,14 +1353,14 @@
+ 		if ((devpath)) {
+ 			struct nameidata nd;
+ 
+-			enum uio_seg seg = UIO_USERSPACE;
++			enum uio_seg seg = probe ? UIO_SYSSPACE : UIO_USERSPACE;
+ #if CONFIG_BASESYSTEMROOT
+ 			if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
+ 				seg = UIO_SYSSPACE;
+ 			}
+ #endif // CONFIG_BASESYSTEMROOT
+ 
+-			NDINIT(&nd, LOOKUP, OP_MOUNT, FOLLOW, seg, devpath, ctx);
++			NDINIT(&nd, LOOKUP, OP_MOUNT, probe ? NOFOLLOW : FOLLOW, seg, devpath, ctx);
+ 			if ((error = namei(&nd))) {
+ 				goto out1;
+ 			}
+@@ -1690,6 +1706,10 @@
+ 			error = EBUSY;
+ 			goto out4;
+ 		}
++		if (probe) {
++			mount_ref(mp, 0);
++			probe->mount = mp;
++		}
+ 		lck_rw_done(&mp->mnt_rwlock);
+ 		is_rwlock_locked = FALSE;
+ 
+@@ -2607,6 +2627,107 @@
+ 	vnode_put(vp);
+ 	/* safedounmount consumes the mount ref */
+ 	return safedounmount(mp, uap->flags, ctx);
++}
++
++static int
++nx721j_read_system_version(mount_t mp, vfs_context_t ctx)
++{
++	static const uint8_t expected[SHA256_DIGEST_LENGTH] = {
++		0xe5, 0xed, 0xe4, 0x60, 0xe1, 0xc3, 0xdc, 0x8d,
++		0x43, 0x3f, 0xc1, 0x3d, 0x9c, 0xfc, 0x14, 0xaf,
++		0x1e, 0xc5, 0x94, 0xe8, 0x9b, 0x5d, 0x47, 0x88,
++		0x8a, 0x37, 0x00, 0x31, 0xcd, 0x58, 0x7e, 0x14,
++	};
++	char data[575];
++	uint8_t digest[SHA256_DIGEST_LENGTH];
++	SHA256_CTX sha;
++	vnode_t vp;
++	int resid = sizeof(data);
++
++	int error = vfs_busy(mp, LK_NOWAIT);
++	if (error != 0) {
++		return error;
++	}
++	vnode_t root;
++	error = VFS_ROOT(mp, &root, ctx);
++	if (error != 0) {
++		vfs_unbusy(mp);
++		return error;
++	}
++	error = vnode_lookupat("System/Library/CoreServices/SystemVersion.plist",
++	    VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT, &vp, ctx, root);
++	vnode_put(root);
++	if (error == 0) {
++		if (vnode_mount(vp) != mp || vnode_vtype(vp) != VREG || !vfs_isrdonly(mp)) {
++			error = EINVAL;
++		} else {
++			error = vnode_authorize(vp, NULLVP, KAUTH_VNODE_READ_DATA, ctx);
++		}
++#if CONFIG_MACF
++		if (error == 0) {
++			error = mac_vnode_check_open(ctx, vp, FREAD);
++		}
++#endif
++		if (error == 0) {
++			error = vn_rdwr(UIO_READ, vp, data, sizeof(data), 0, UIO_SYSSPACE, 0,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		}
++		vnode_put(vp);
++	}
++	vfs_unbusy(mp);
++	if (error != 0) {
++		return error;
++	}
++	if (resid != 1) {
++		return EIO;
++	}
++	SHA256_Init(&sha);
++	SHA256_Update(&sha, data, sizeof(data) - 1);
++	SHA256_Final(digest, &sha);
++	return memcmp(digest, expected, sizeof(digest)) == 0 ? 0 : EIO;
++}
++
++int nx721j_usb_apfs_readonly_check(const char *device_path, int *read_error, int *unmount_error);
++
++int
++nx721j_usb_apfs_readonly_check(const char *device_path, int *read_error, int *unmount_error)
++{
++	struct nameidata nd;
++	vfs_context_t ctx = vfs_context_current();
++	struct nx721j_apfs_mount probe = { .device_path = device_path };
++	const char prefix[] = "/dev/disk";
++	if (strncmp(device_path, prefix, sizeof(prefix) - 1) != 0 ||
++	    strchr(device_path + sizeof(prefix) - 1, '/') != NULL) {
++		return EINVAL;
++	}
++
++	NDINIT(&nd, LOOKUP, OP_MOUNT, NOFOLLOW | NOCROSSMOUNT | WANTPARENT,
++	    UIO_SYSSPACE, CAST_USER_ADDR_T("/mnt"), ctx);
++	int error = namei(&nd);
++	if (error != 0) {
++		return error;
++	}
++	error = mount_common("apfs", nd.ni_dvp, nd.ni_vp, &nd.ni_cnd, USER_ADDR_NULL,
++	    MNT_RDONLY | MNT_NODEV | MNT_NOSUID | MNT_NOEXEC | MNT_DONTBROWSE,
++	    KERNEL_MOUNT_FMOUNT, NULL, ctx, &probe);
++	vnode_put(nd.ni_vp);
++	vnode_put(nd.ni_dvp);
++	nameidone(&nd);
++	if (error != 0) {
++		return error;
++	}
++
++	*read_error = nx721j_read_system_version(probe.mount, ctx);
++#if CONFIG_MACF
++	*unmount_error = mac_mount_check_umount(ctx, probe.mount);
++	if (*unmount_error != 0) {
++		mount_drop(probe.mount, 0);
++		return 0;
++	}
++#endif
++	/* safedounmount consumes the reference taken by mount_common. */
++	*unmount_error = safedounmount(probe.mount, 0, ctx);
++	return 0;
+ }
+ 
+ int
+@@ -14511,7 +14632,7 @@
+ 	smnt_data.sm_cnp = &snapndp->ni_cnd;
+ 	error = mount_common(mp->mnt_vfsstat.f_fstypename, pvp, vp,
+ 	    &dirndp->ni_cnd, CAST_USER_ADDR_T(&smnt_data), flags & (MNT_DONTBROWSE | MNT_IGNORE_OWNERSHIP),
+-	    KERNEL_MOUNT_SNAPSHOT, NULL, ctx);
++	    KERNEL_MOUNT_SNAPSHOT, NULL, ctx, NULL);
+ 
+ out2:
+ 	vnode_put(vp);

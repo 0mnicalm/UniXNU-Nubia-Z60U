@@ -15,6 +15,7 @@
 #include <sys/vnode.h>
 
 extern "C" uint32_t nx721j_apfs_match_trace();
+extern "C" int nx721j_usb_apfs_readonly_check(const char *devicePath, int *readError, int *unmountError);
 
 namespace {
 constexpr UInt64 blockBytes = 4096;
@@ -23,7 +24,8 @@ constexpr IOByteCount stagingBytes = blockBytes * maxBlocksPerRead;
 constexpr unsigned probeSeconds = 45;
 constexpr unsigned probeIntervalSeconds = 5;
 constexpr char apfsContentHint[] = "7C3457EF-0000-11AA-AA11-00306543ECAC";
-constexpr const char *testMountPoints[] = {"/mnt", "/Volumes"};
+constexpr UInt32 mountStatusTag = 0x4e580000;
+constexpr UInt32 mountAttempt = 34;
 enum ProbePhase : UInt32 {
   kProbePublished = 1,
   kProbeReadCompleted,
@@ -43,6 +45,12 @@ enum ProbePhase : UInt32 {
   kProbeBlockIoFailed,
   kProbeApfsDevfsBlock,
   kProbeApfsMountPoint,
+};
+constexpr UInt64 mountPrerequisites = (1ULL << kProbeApfsDevfsBlock) | (1ULL << kProbeApfsMountPoint);
+enum MountStage : UInt32 {
+  kMountVolume = 1,
+  kMountReadFile,
+  kMountUnmount,
 };
 
 bool hasApfsPartitionPersonality(IOService *partition)
@@ -79,10 +87,10 @@ bool hasApfsPartitionPersonality(IOService *partition)
   return found;
 }
 
-UInt64 storageTopology(IOService *device)
+UInt64 storageTopology(IOService *device, char (&devicePath)[64])
 {
   UInt64 seen = 0;
-  char devicePath[64] = {};
+  devicePath[0] = '\0';
   auto entries = IORegistryIterator::iterateOver(device, gIOServicePlane, kIORegistryIterateRecursively);
   if (!entries) {
     return seen;
@@ -147,16 +155,12 @@ UInt64 storageTopology(IOService *device)
       }
       vnode_put(vnode);
     }
-    for (const char *path : testMountPoints) {
-      constexpr int flags = VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT;
-      if (vnode_lookup(path, flags, &vnode, ctx) == 0) {
-        const bool available = vnode_vtype(vnode) == VDIR && !vnode_mountedhere(vnode);
-        vnode_put(vnode);
-        if (available) {
-          seen |= 1ULL << kProbeApfsMountPoint;
-          break;
-        }
+    constexpr int flags = VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT;
+    if (vnode_lookup("/mnt", flags, &vnode, ctx) == 0) {
+      if (vnode_vtype(vnode) == VDIR && !vnode_mountedhere(vnode)) {
+        seen |= 1ULL << kProbeApfsMountPoint;
       }
+      vnode_put(vnode);
     }
   }
   return seen | nx721j_apfs_match_trace();
@@ -241,6 +245,22 @@ public:
     }
     IOLockUnlock(gate);
     return reported;
+  }
+
+  bool reportMountStatus(Nx721jUsbBlockTransport &transport, UInt32 status)
+  {
+    IOLockLock(gate);
+    const bool reported = online && transport.report(status);
+    if (!reported) {
+      clearTransport();
+    }
+    IOLockUnlock(gate);
+    return reported;
+  }
+
+  bool reportMountResult(Nx721jUsbBlockTransport &transport, MountStage stage, int error)
+  {
+    return reportMountStatus(transport, mountStatusTag | (stage << 8) | (static_cast<UInt32>(error) & 0xff));
   }
 
   UInt32 blockRequestTrace() const
@@ -433,12 +453,30 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
   }
 
   UInt64 reportedTopology = 0;
+  bool mountAttempted = false;
+  int mountError = 0;
+  int readError = 0;
+  int unmountError = 0;
+  char devicePath[64];
   for (unsigned elapsed = 0; elapsed < probeSeconds; elapsed += probeIntervalSeconds) {
-    const UInt64 topology = storageTopology(device) | device->blockRequestTrace();
+    const UInt64 topology = storageTopology(device, devicePath) | device->blockRequestTrace();
     if (!device->reportProbeProgress(*transport, topology & ~reportedTopology)) {
       break;
     }
     reportedTopology |= topology;
+    if (!mountAttempted && (topology & mountPrerequisites) == mountPrerequisites) {
+      if (!device->reportMountStatus(*transport, mountAttempt)) {
+        break;
+      }
+      mountAttempted = true;
+      mountError = nx721j_usb_apfs_readonly_check(devicePath, &readError, &unmountError);
+      if (!device->reportMountResult(*transport, kMountVolume, mountError) ||
+          (!mountError &&
+           (!device->reportMountResult(*transport, kMountReadFile, readError) ||
+            !device->reportMountResult(*transport, kMountUnmount, unmountError)))) {
+        break;
+      }
+    }
     IOSleep(probeIntervalSeconds * 1000);
   }
   device->quiesce();
@@ -458,6 +496,9 @@ unsigned nx721j_usb_run_registration_probe(Nx721jUsbBlockTransport *transport)
   }
   if (!read) {
     return 54;
+  }
+  if (!mountAttempted || mountError || readError || unmountError) {
+    return 56;
   }
   return closed ? 0 : 55;
 }

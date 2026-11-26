@@ -110,6 +110,7 @@ jobs:
         run: |
           ./unixnu fetch IOStorageFamily -D "$GITHUB_WORKSPACE"
           cp "$GITHUB_WORKSPACE/scripts/nx721j-apfs-match-trace.patch" patches/xnu/
+          cp "$GITHUB_WORKSPACE/scripts/nx721j-apfs-mount-test.patch" patches/xnu/
 
       - name: Build kernel
         working-directory: unixnu
