@@ -8,7 +8,7 @@
  #include <sys/uio_internal.h>
  #include <kern/kalloc.h>
  #include <sys/mman.h>
-@@ -194,9 +195,28 @@
+@@ -194,9 +195,30 @@
      user_addr_t bufp, int *sizep, boolean_t is_64_bit,
      boolean_t partial_copy);
  static int fsync_common(proc_t p, struct fsync_args *uap, int flags);
@@ -22,6 +22,8 @@
 +	NX721J_MOUNT_DEVICE_OPEN,
 +	NX721J_MOUNT_FILESYSTEM,
 +	NX721J_MOUNT_PUBLISH,
++	NX721J_MOUNT_LATE_POLICY,
++	NX721J_MOUNT_COVERED_VNODE,
 +};
 +
 +struct nx721j_apfs_mount {
@@ -38,7 +40,7 @@
  void vfs_notify_mount(vnode_t pdvp);
  
  int prepare_coveredvp(vnode_t vp, vfs_context_t ctx, struct componentname *cnp, const char *fsname, uint32_t internal_flags);
-@@ -328,7 +348,7 @@
+@@ -328,7 +350,7 @@
  
  	kern_flags |= KERNEL_MOUNT_KMOUNT;
  	error = mount_common(fstype, pvp, vp, &nd.ni_cnd, CAST_USER_ADDR_T(data),
@@ -47,7 +49,7 @@
  
  	if (did_namei) {
  		vnode_put(vp);
-@@ -459,7 +479,7 @@
+@@ -459,7 +481,7 @@
  		return error;
  	}
  
@@ -56,7 +58,7 @@
  
  	zfree(ZV_NAMEI, cn.cn_pnbuf);
  	vnode_put(pvp);
-@@ -953,7 +973,7 @@
+@@ -953,7 +975,7 @@
  	}
  
  	error = mount_common(fstypename, pvp, vp, &nd.ni_cnd, uap->data, flags, 0,
@@ -65,7 +67,7 @@
  
  out:
  
-@@ -991,7 +1011,7 @@
+@@ -991,7 +1013,7 @@
  static int
  mount_common(const char *fstypename, vnode_t pvp, vnode_t vp,
      struct componentname *cnp, user_addr_t fsmountargs, int flags, uint32_t internal_flags,
@@ -74,7 +76,7 @@
  {
  #if !CONFIG_MACF
  #pragma unused(labelstr)
-@@ -1165,6 +1185,14 @@
+@@ -1165,6 +1187,14 @@
  		goto out1;
  	}
  
@@ -89,7 +91,7 @@
  	error = prepare_coveredvp(vp, ctx, cnp, fstypename, internal_flags);
  	if (error != 0) {
  		goto out1;
-@@ -1316,6 +1344,10 @@
+@@ -1316,6 +1346,10 @@
  		}
  #endif // CONFIG_BASESYSTEMROOT
  
@@ -100,7 +102,7 @@
  		if (do_copyin_devpath) {
  			if (vfs_context_is64bit(ctx)) {
  				if ((error = copyin(fsmountargs, (caddr_t)&devpath, sizeof(devpath)))) {
-@@ -1337,14 +1369,17 @@
+@@ -1337,14 +1371,17 @@
  		if ((devpath)) {
  			struct nameidata nd;
  
@@ -120,7 +122,7 @@
  			if ((error = namei(&nd))) {
  				goto out1;
  			}
-@@ -1388,14 +1423,23 @@
+@@ -1388,14 +1425,23 @@
  			 * (except for root, which might share swap device for miniroot).
  			 * Flush out any old buffers remaining from a previous use.
  			 */
@@ -144,7 +146,7 @@
  			}
  			if ((error = VNOP_FSYNC(devvp, MNT_WAIT, ctx))) {
  				error = ENOTBLK;
-@@ -1414,6 +1458,9 @@
+@@ -1414,6 +1460,9 @@
  				goto out3;
  			}
  #endif /* MAC */
@@ -154,7 +156,7 @@
  			if ((error = VNOP_OPEN(devvp, ronly ? FREAD : FREAD | FWRITE, ctx))) {
  				goto out3;
  			}
-@@ -1582,6 +1629,9 @@
+@@ -1582,6 +1631,9 @@
  		error = EINVAL;
  #endif
  	} else {
@@ -164,7 +166,27 @@
  		error = VFS_MOUNT(mp, device_vnode, fsmountargs, ctx);
  	}
  
-@@ -1682,6 +1732,9 @@
+@@ -1623,6 +1675,9 @@
+ 		}
+ 
+ #if CONFIG_MACF
++		if (probe) {
++			probe->step = NX721J_MOUNT_LATE_POLICY;
++		}
+ 		error = mac_mount_check_mount_late(ctx, mp);
+ 		if (error != 0) {
+ 			goto out4;
+@@ -1646,6 +1701,9 @@
+ 		}
+ #endif  /* MAC */
+ 
++		if (probe) {
++			probe->step = NX721J_MOUNT_COVERED_VNODE;
++		}
+ 		vnode_lock_spin(vp);
+ 		CLR(vp->v_flag, VMOUNT);
+ 		vp->v_mountedhere = mp;
+@@ -1682,6 +1740,9 @@
  		 */
  		(void)VFS_START(mp, 0, ctx);
  
@@ -174,7 +196,7 @@
  		if (mount_list_add(mp) != 0) {
  			/*
  			 * The system is shutting down trying to umount
-@@ -1689,6 +1742,10 @@
+@@ -1689,6 +1750,10 @@
  			 */
  			error = EBUSY;
  			goto out4;
@@ -185,7 +207,7 @@
  		}
  		lck_rw_done(&mp->mnt_rwlock);
  		is_rwlock_locked = FALSE;
-@@ -2607,6 +2664,111 @@
+@@ -2607,6 +2672,111 @@
  	vnode_put(vp);
  	/* safedounmount consumes the mount ref */
  	return safedounmount(mp, uap->flags, ctx);
@@ -297,7 +319,7 @@
  }
  
  int
-@@ -14511,7 +14673,7 @@
+@@ -14511,7 +14681,7 @@
  	smnt_data.sm_cnp = &snapndp->ni_cnd;
  	error = mount_common(mp->mnt_vfsstat.f_fstypename, pvp, vp,
  	    &dirndp->ni_cnd, CAST_USER_ADDR_T(&smnt_data), flags & (MNT_DONTBROWSE | MNT_IGNORE_OWNERSHIP),
