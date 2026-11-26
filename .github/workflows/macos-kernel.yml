@@ -94,6 +94,32 @@ jobs:
           xcodebuild -version
           xcode-select -p
 
+      - name: Build the NX721J userspace APFS probe
+        if: ${{ github.ref == 'refs/heads/codex/nx721j-usb-block' }}
+        run: |
+          set -euo pipefail
+          out=build/nx721j-userspace-apfs
+          mkdir -p "$out"
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$sdk" \
+            -std=c11 -D_DARWIN_C_SOURCE -Os -Wall -Wextra -Werror \
+            kits/nx721j/ApfsReadOnlyProbe.c -o "$out/apfs-readonly-probe"
+          codesign --force --sign - --pagesize 4096 --identifier org.unixnu.nx721j.apfs-probe "$out/apfs-readonly-probe"
+          codesign --verify --strict "$out/apfs-readonly-probe"
+          codesign --display --verbose=4 "$out/apfs-readonly-probe" 2> "$out/signature.txt"
+          grep -Fx 'Page size=4096' "$out/signature.txt"
+          xcrun otool -L "$out/apfs-readonly-probe" > "$out/dependencies.txt"
+          shasum -a 256 "$out/apfs-readonly-probe" > "$out/sha256.txt"
+
+      - name: Upload the NX721J userspace APFS probe
+        if: ${{ github.ref == 'refs/heads/codex/nx721j-usb-block' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nx721j-userspace-apfs-${{ github.run_number }}
+          path: build/nx721j-userspace-apfs/
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Select defconfig
         working-directory: unixnu
         run: ./unixnu defconfig nx721j_probe_defconfig -D "$GITHUB_WORKSPACE"
